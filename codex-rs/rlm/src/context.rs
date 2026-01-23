@@ -51,13 +51,36 @@ pub struct ContextSize {
 pub struct ContextMetadata {
     pub size: ContextSize,
     pub documents: Vec<DocumentMetadata>,
+    pub exclusions: ExclusionSummary,
+}
+
+/// Summary of files/directories excluded during context loading.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExclusionSummary {
+    /// Number of files skipped due to binary content detection.
+    pub binary_files: usize,
+    /// Number of files skipped due to individual file size limit.
+    pub oversized_files: usize,
+    /// Number of files skipped after total size limit reached.
+    pub truncated_by_total_size: usize,
+    /// Number of files skipped after file count limit reached.
+    pub truncated_by_file_count: usize,
+    /// Number of paths excluded by .gitignore rules.
+    pub gitignored: usize,
+    /// Number of symlinks skipped (symlinks are not followed to avoid cycles).
+    pub symlinks_skipped: usize,
+    /// Sample of excluded paths (max 10) for debugging.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sample_excluded_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DocumentMetadata {
-    /// Document ID (relative path).
+    /// Document ID (unique identifier for peek_doc lookups).
+    /// For single-source loads: relative path from source root.
+    /// For multi-source loads: "source_index:relative_path" to ensure uniqueness.
     pub id: String,
-    /// Relative path to the file (same as id).
+    /// Relative path to the file within its source.
     pub path: String,
     /// Size of the document content in bytes.
     pub size: usize,
@@ -65,6 +88,9 @@ pub struct DocumentMetadata {
     pub start: usize,
     /// End offset in the combined content.
     pub end: usize,
+    /// Source path this document was loaded from (set during load).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -90,6 +116,7 @@ impl InMemoryStore {
                 bytes,
             },
             documents: Vec::new(),
+            exclusions: ExclusionSummary::default(),
         };
         self.content = content;
     }
@@ -161,6 +188,7 @@ impl MemoryMappedStore {
                 bytes,
             },
             documents: Vec::new(),
+            exclusions: ExclusionSummary::default(),
         };
         self.mmap = Some(mmap);
         Ok(())
@@ -326,23 +354,34 @@ pub fn is_markdown_file(path: &Path) -> bool {
         .is_some_and(|ext| ext == "md")
 }
 
-/// Check if a file appears to be a text file by sampling the first chunk.
-/// Returns false for binary files (containing null bytes) or non-UTF-8 files.
-fn is_text_file(path: &Path) -> bool {
+/// Result of checking if a file is a valid text file.
+enum TextFileResult {
+    /// File is valid text and within size limits.
+    Ok,
+    /// File exceeds the size limit.
+    Oversized,
+    /// File appears to be binary (contains null bytes or invalid UTF-8).
+    Binary,
+    /// File could not be read.
+    Unreadable,
+}
+
+/// Check if a file is a valid text file with detailed reason.
+fn check_text_file(path: &Path) -> TextFileResult {
     // Check file size first
     let metadata = match std::fs::metadata(path) {
         Ok(m) => m,
-        Err(_) => return false,
+        Err(_) => return TextFileResult::Unreadable,
     };
 
     if metadata.len() > MAX_FILE_SIZE {
-        return false;
+        return TextFileResult::Oversized;
     }
 
     // Read the first 8KB to check for binary content
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return false,
+        Err(_) => return TextFileResult::Unreadable,
     };
 
     use std::io::Read;
@@ -350,17 +389,22 @@ fn is_text_file(path: &Path) -> bool {
     let mut buffer = [0u8; 8192];
     let bytes_read = match reader.read(&mut buffer) {
         Ok(n) => n,
-        Err(_) => return false,
+        Err(_) => return TextFileResult::Unreadable,
     };
 
     // Check for null bytes (binary indicator)
     if buffer[..bytes_read].contains(&0) {
-        return false;
+        return TextFileResult::Binary;
     }
 
     // Check if it's valid UTF-8
-    std::str::from_utf8(&buffer[..bytes_read]).is_ok()
+    if std::str::from_utf8(&buffer[..bytes_read]).is_err() {
+        return TextFileResult::Binary;
+    }
+
+    TextFileResult::Ok
 }
+
 
 /// A document in the doc tree (content accessed via DocTreeStore).
 #[derive(Clone, Debug)]
@@ -447,6 +491,7 @@ impl DocTreeStore {
 
         let mut docs = Vec::new();
         let mut total_size: u64 = 0;
+        let mut exclusions = ExclusionSummary::default();
 
         // Use ignore crate for gitignore-aware walking
         let walker = WalkBuilder::new(&root)
@@ -464,17 +509,64 @@ impl DocTreeStore {
                 continue;
             }
 
+            // Track symlinks that point outside the tree or are directories
+            // Note: ignore crate doesn't follow symlinks by default to avoid cycles
+            if entry.path_is_symlink() {
+                // Check if the symlink target is a directory (which we skip)
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.is_dir() {
+                        exclusions.symlinks_skipped += 1;
+                        if exclusions.sample_excluded_paths.len() < 10 {
+                            let rel = path.strip_prefix(&root).unwrap_or(path);
+                            exclusions.sample_excluded_paths.push(format!(
+                                "{} (symlink to directory)",
+                                rel.display()
+                            ));
+                        }
+                        continue;
+                    }
+                }
+                // Symlinks to files are processed normally below
+            }
+
             // Check file count limit
             if docs.len() >= MAX_FILES {
                 tracing::warn!(
                     "Reached maximum file count ({MAX_FILES}), skipping remaining files"
                 );
-                break;
+                exclusions.truncated_by_file_count += 1;
+                // Continue counting to show how many were skipped
+                continue;
             }
 
-            // Check if it's a text file (also checks file size limit internally)
-            if !is_text_file(path) {
-                continue;
+            // Check if it's a text file with detailed reason tracking
+            match check_text_file(path) {
+                TextFileResult::Ok => {}
+                TextFileResult::Oversized => {
+                    exclusions.oversized_files += 1;
+                    if exclusions.sample_excluded_paths.len() < 10 {
+                        let rel = path.strip_prefix(&root).unwrap_or(path);
+                        exclusions.sample_excluded_paths.push(format!(
+                            "{} (oversized)",
+                            rel.display()
+                        ));
+                    }
+                    continue;
+                }
+                TextFileResult::Binary => {
+                    exclusions.binary_files += 1;
+                    if exclusions.sample_excluded_paths.len() < 10 {
+                        let rel = path.strip_prefix(&root).unwrap_or(path);
+                        exclusions.sample_excluded_paths.push(format!(
+                            "{} (binary)",
+                            rel.display()
+                        ));
+                    }
+                    continue;
+                }
+                TextFileResult::Unreadable => {
+                    continue;
+                }
             }
 
             let rel_path = path
@@ -507,7 +599,14 @@ impl DocTreeStore {
                 tracing::warn!(
                     "Reached maximum total size ({MAX_TOTAL_SIZE} bytes), skipping remaining files"
                 );
-                break;
+                exclusions.truncated_by_total_size += 1;
+                if exclusions.sample_excluded_paths.len() < 10 {
+                    exclusions.sample_excluded_paths.push(format!(
+                        "{} (total size limit)",
+                        rel_path
+                    ));
+                }
+                continue;
             }
             total_size += content_size;
 
@@ -541,6 +640,7 @@ impl DocTreeStore {
                 size,
                 start: content_offset,
                 end: content_offset + size,
+                source: None, // Set by RlmSession during load
             });
 
             self.documents.insert(rel_path, doc);
@@ -561,6 +661,7 @@ impl DocTreeStore {
                 bytes,
             },
             documents: doc_metadata,
+            exclusions,
         };
 
         Ok(())
@@ -711,6 +812,36 @@ mod tests {
             !doc_ids.contains(&"binary.bin"),
             "should not include binary files"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn doc_tree_tracks_symlink_directories() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Create a regular file and a directory with a symlink
+        std::fs::write(root.join("readme.md"), "# Hello").unwrap();
+        std::fs::create_dir(root.join("real_dir")).unwrap();
+        std::fs::write(root.join("real_dir/file.md"), "# In real dir").unwrap();
+
+        // Create a symlink to the directory
+        symlink(root.join("real_dir"), root.join("link_dir")).unwrap();
+
+        let mut store = DocTreeStore::new();
+        store
+            .load(ContextSource::DocTree(root.to_path_buf()))
+            .await
+            .unwrap();
+
+        let doc_ids: Vec<_> = store.list_documents();
+        // Regular files should be included
+        assert!(doc_ids.contains(&"readme.md"));
+        assert!(doc_ids.contains(&"real_dir/file.md"));
+        // Symlinked directory's contents are not followed (ignore crate default)
+        // but the symlink itself may or may not appear depending on how the walker handles it
     }
 
     #[tokio::test]

@@ -100,11 +100,21 @@ const RLM_TOOL_INSTRUCTIONS: &str = r#"
 When RLM tools are available, use them for exploring large codebases or documents:
 
 - **rlm_load(path)**: Load file/directory context (resets session state)
+- **rlm_load_append(path)**: Add additional context (preserves state)
 - **rlm_query(prompt)**: Fast read-only scan; prefer for quick questions
 - **rlm_exec(code)**: Python execution for structured extraction + multi-step analysis
-  - Builtins: `peek(start, end)`, `find(pattern)`, `search(query, k)`, `list_docs()`, `stats()`
+  - Builtins: `list_docs()`, `peek_doc(doc_id, start, end)`, `find(pattern)`, `search(query, k)`, `stats()`
+  - Use `peek_doc(doc_id)` to read specific files—avoids boundary confusion with multi-file contexts
+  - `find()` returns `{"matches": [...], "capped": bool}`—check `capped` for truncation
   - Set `result = {...}` for structured JSON return
 - **llm_query(prompt)**: Spawn sub-agent on a snippet (inside rlm_exec)
+
+Tips:
+- Use `list_docs()` to see available files with their IDs and byte ranges
+- For appended sources (rlm_load_append), doc IDs are prefixed with source index (e.g., "1:path/file.txt")
+- Each document includes a `source` field showing which load it came from
+- Check `exclusions` in rlm_load stats to see why files were skipped (binary, oversized, symlinks, limits)
+- Symlinks to directories are NOT followed (to avoid cycles); symlinks to files are included
 
 Workflow: rlm_load → rlm_query (quick) or rlm_exec (complex) → iterate as needed.
 "#;

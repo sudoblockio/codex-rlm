@@ -13,6 +13,7 @@ use codex_rlm::context::ContextSource;
 use codex_rlm::context::ContextStore;
 use codex_rlm::context::ContextStoreKind;
 use codex_rlm::context::DocumentMetadata;
+use codex_rlm::context::ExclusionSummary;
 use codex_rlm::estimate_tokens;
 use codex_rlm::index::Bm25Index;
 use codex_rlm::index::IndexConfig;
@@ -89,6 +90,21 @@ pub(crate) struct RlmLoadStats {
     pub(crate) sources: Vec<String>,
     /// SHA256 hash of the context for determinism verification and replay.
     pub(crate) context_hash: String,
+    /// Summary of files excluded during loading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) exclusions: Option<RlmExclusionSummary>,
+}
+
+/// Summary of files excluded during context loading (mirrors codex_rlm::context::ExclusionSummary).
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct RlmExclusionSummary {
+    pub(crate) binary_files: usize,
+    pub(crate) oversized_files: usize,
+    pub(crate) truncated_by_total_size: usize,
+    pub(crate) truncated_by_file_count: usize,
+    pub(crate) symlinks_skipped: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) sample_excluded_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -115,6 +131,7 @@ struct RlmLoadedContext {
     content: String,
     documents: Vec<DocumentMetadata>,
     routing_graph: Option<HierarchicalRoutingGraph>,
+    exclusions: ExclusionSummary,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +161,8 @@ pub(crate) struct RlmSession {
     budget_state: Arc<StdMutex<BudgetSnapshot>>,
     context_loaded: bool,
     bm25_index: Arc<StdMutex<Option<Bm25Index>>>,
+    /// Accumulated exclusion statistics from all loads.
+    exclusions: ExclusionSummary,
 }
 
 impl RlmSession {
@@ -167,6 +186,7 @@ impl RlmSession {
             budget_state: Arc::new(StdMutex::new(budget)),
             context_loaded: false,
             bm25_index: Arc::new(StdMutex::new(None)),
+            exclusions: ExclusionSummary::default(),
         })
     }
 
@@ -196,6 +216,25 @@ impl RlmSession {
             format!("{:x}", hasher.finalize())
         };
 
+        // Convert exclusions to RlmExclusionSummary if any exclusions occurred
+        let exclusions = if self.exclusions.binary_files > 0
+            || self.exclusions.oversized_files > 0
+            || self.exclusions.truncated_by_total_size > 0
+            || self.exclusions.truncated_by_file_count > 0
+            || self.exclusions.symlinks_skipped > 0
+        {
+            Some(RlmExclusionSummary {
+                binary_files: self.exclusions.binary_files,
+                oversized_files: self.exclusions.oversized_files,
+                truncated_by_total_size: self.exclusions.truncated_by_total_size,
+                truncated_by_file_count: self.exclusions.truncated_by_file_count,
+                symlinks_skipped: self.exclusions.symlinks_skipped,
+                sample_excluded_paths: self.exclusions.sample_excluded_paths.clone(),
+            })
+        } else {
+            None
+        };
+
         RlmLoadStats {
             length_chars,
             length_tokens_estimate,
@@ -205,6 +244,7 @@ impl RlmSession {
             routing_entry_count,
             sources: self.sources.clone(),
             context_hash,
+            exclusions,
         }
     }
 
@@ -238,13 +278,45 @@ impl RlmSession {
         // Enforce total memory limit before proceeding
         self.enforce_total_memory_limit()?;
 
-        self.sources.push(path_label);
-        self.documents.extend(loaded.documents);
+        // Determine source index for this load
+        let source_index = self.sources.len();
+        self.sources.push(path_label.clone());
+
+        // Update document metadata with source info and unique IDs
+        let mut updated_docs: Vec<_> = loaded
+            .documents
+            .into_iter()
+            .map(|mut doc| {
+                // Set source on each document
+                doc.source = Some(path_label.clone());
+                // If this is an appended source (not the first), prefix ID to ensure uniqueness
+                if source_index > 0 {
+                    doc.id = format!("{}:{}", source_index, doc.id);
+                }
+                doc
+            })
+            .collect();
+        self.documents.append(&mut updated_docs);
+
         if loaded.routing_graph.is_some() {
             self.routing_graph = loaded.routing_graph;
         }
         self.context_loaded = true;
         self.clear_bm25_index();
+
+        // Accumulate exclusions from this load
+        self.exclusions.binary_files += loaded.exclusions.binary_files;
+        self.exclusions.oversized_files += loaded.exclusions.oversized_files;
+        self.exclusions.truncated_by_total_size += loaded.exclusions.truncated_by_total_size;
+        self.exclusions.truncated_by_file_count += loaded.exclusions.truncated_by_file_count;
+        self.exclusions.gitignored += loaded.exclusions.gitignored;
+        self.exclusions.symlinks_skipped += loaded.exclusions.symlinks_skipped;
+        // Keep sample paths up to 10 total
+        for path in loaded.exclusions.sample_excluded_paths {
+            if self.exclusions.sample_excluded_paths.len() < 10 {
+                self.exclusions.sample_excluded_paths.push(path);
+            }
+        }
 
         self.refresh_python_context()?;
         Ok(self.stats())
@@ -504,6 +576,7 @@ impl RlmSession {
         }
         self.context_loaded = false;
         self.clear_bm25_index();
+        self.exclusions = ExclusionSummary::default();
         Ok(())
     }
 
@@ -608,7 +681,9 @@ impl RlmSession {
         let mut store = ContextStoreKind::new();
         store.load(source).await?;
         let content = store.content()?.to_string();
-        let documents = store.metadata().documents.clone();
+        let metadata = store.metadata();
+        let documents = metadata.documents.clone();
+        let exclusions = metadata.exclusions.clone();
         let routing_graph = store
             .as_doc_tree()
             .map(HierarchicalRoutingGraph::from_doc_tree);
@@ -616,6 +691,7 @@ impl RlmSession {
             content,
             documents,
             routing_graph,
+            exclusions,
         })
     }
 
@@ -1133,6 +1209,153 @@ result = {'text': text, 'match_count': len(find_result['matches']), 'capped': fi
         // Verify context contains both documents
         assert!(session.context().contains("First document"));
         assert!(session.context().contains("Second document"));
+    }
+
+    #[tokio::test]
+    async fn load_append_creates_unique_document_ids() {
+        let mut session = RlmSession::new().unwrap();
+
+        // Create two directories with files that have the same basename
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir1.path().join("README.md"), "# First source").unwrap();
+        std::fs::write(dir2.path().join("README.md"), "# Second source").unwrap();
+
+        // Load first directory
+        session
+            .load_path(dir1.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+
+        // Append second directory (has same filename README.md)
+        session
+            .load_path(dir2.path(), RlmLoadMode::Append)
+            .await
+            .unwrap();
+
+        // Use list_docs() to verify document IDs are unique
+        let outcome = session
+            .exec(
+                r#"
+docs = list_docs()
+ids = [d['id'] for d in docs]
+sources = [d.get('source') for d in docs]
+result = {
+    'count': len(docs),
+    'ids': ids,
+    'sources': sources,
+    'unique_ids': len(set(ids)) == len(ids),
+}
+"#,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(outcome.result.error.is_none(), "exec should succeed");
+        let result: serde_json::Value =
+            serde_json::from_str(&outcome.result.result_json.unwrap()).unwrap();
+
+        // Should have 2 documents
+        assert_eq!(result["count"], 2);
+        // All IDs should be unique (even though both are README.md)
+        assert_eq!(result["unique_ids"], true);
+        // Each document should have a source
+        let sources = result["sources"].as_array().unwrap();
+        assert!(sources.iter().all(|s| !s.is_null()));
+        // Second document ID should be prefixed with source index "1:"
+        let ids = result["ids"].as_array().unwrap();
+        let second_id = ids[1].as_str().unwrap();
+        assert!(
+            second_id.starts_with("1:"),
+            "Second doc ID should be prefixed with source index: {second_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_includes_exclusion_summary() {
+        let mut session = RlmSession::new().unwrap();
+
+        // Create a directory with a binary file and a text file
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("readme.md"), "# Hello World").unwrap();
+        // Create a binary file (containing null bytes)
+        std::fs::write(dir.path().join("binary.dat"), b"\x00\x01\x02\x03").unwrap();
+
+        let stats = session
+            .load_path(dir.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+
+        // Should have exclusions for binary file
+        assert!(stats.exclusions.is_some(), "should have exclusion summary");
+        let exclusions = stats.exclusions.unwrap();
+        assert_eq!(exclusions.binary_files, 1, "should track binary file");
+        assert!(
+            exclusions.sample_excluded_paths.iter().any(|p| p.contains("binary")),
+            "should include sample path for binary file"
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusions_accumulate_across_appends() {
+        let mut session = RlmSession::new().unwrap();
+
+        // Create two directories, each with a binary file
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir1.path().join("readme.md"), "# First").unwrap();
+        std::fs::write(dir1.path().join("bin1.dat"), b"\x00\x01").unwrap();
+        std::fs::write(dir2.path().join("notes.md"), "# Second").unwrap();
+        std::fs::write(dir2.path().join("bin2.dat"), b"\x00\x02").unwrap();
+
+        // Load first directory
+        let stats1 = session
+            .load_path(dir1.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats1.exclusions.as_ref().map(|e| e.binary_files).unwrap_or(0),
+            1
+        );
+
+        // Append second directory - exclusions should accumulate
+        let stats2 = session
+            .load_path(dir2.path(), RlmLoadMode::Append)
+            .await
+            .unwrap();
+        let exclusions = stats2.exclusions.unwrap();
+        assert_eq!(exclusions.binary_files, 2, "should accumulate binary counts");
+    }
+
+    #[tokio::test]
+    async fn reset_clears_exclusions() {
+        let mut session = RlmSession::new().unwrap();
+
+        // Create directory with binary file
+        let dir1 = tempfile::tempdir().unwrap();
+        std::fs::write(dir1.path().join("readme.md"), "# Hello").unwrap();
+        std::fs::write(dir1.path().join("bin.dat"), b"\x00").unwrap();
+
+        session
+            .load_path(dir1.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+
+        // Create clean directory without exclusions
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir2.path().join("clean.md"), "# Clean").unwrap();
+
+        // Reset should clear previous exclusions
+        let stats = session
+            .load_path(dir2.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+        assert!(
+            stats.exclusions.is_none(),
+            "reset should clear exclusions from previous load"
+        );
     }
 
     #[tokio::test]

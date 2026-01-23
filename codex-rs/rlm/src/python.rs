@@ -739,15 +739,16 @@ def search(query, k=10):
     return json.loads(results_json)
 
 
-def find_routes(topic, limit=10):
+def find_routes(topic, limit=10, validate_paths=True):
     """Find routing entries matching a topic.
 
     Args:
         topic: Search query string
         limit: Maximum number of results (default 10)
+        validate_paths: If True (default), only return routes with existing paths
 
     Returns:
-        List of dicts with keys: agents_path, label, path, description, score, depth
+        List of dicts with keys: agents_path, label, path, description, score, depth, path_exists
     """
     data = _state.get("hierarchical_routing_json")
     if not data:
@@ -758,13 +759,27 @@ def find_routes(topic, limit=10):
     topic_lower = topic.lower()
     topic_words = topic_lower.split()
 
+    # Build set of valid document paths for validation
+    valid_paths = set()
+    doc_list_json = _state.get("document_list_json")
+    if doc_list_json:
+        doc_list = json.loads(doc_list_json)
+        for doc in doc_list:
+            doc_path = doc.get("path") or doc.get("id")
+            if doc_path:
+                valid_paths.add(doc_path)
+    # Also add all AGENTS.md paths from the routing graph (they're valid navigation targets)
+    for node_path in nodes.keys():
+        valid_paths.add(node_path)
+
     matches = []
     for node_path, node in nodes.items():
         depth = node.get("depth", 0)
         for entry in node.get("entries", []):
             label = entry.get("label", "").lower()
             desc = entry.get("description", "").lower()
-            path = entry.get("path", "").lower()
+            entry_path = entry.get("path", "")
+            path_lower = entry_path.lower()
 
             score = 0.0
             # Exact phrase matches
@@ -772,7 +787,7 @@ def find_routes(topic, limit=10):
                 score += 10.0
             if topic_lower in desc:
                 score += 5.0
-            if topic_lower in path:
+            if topic_lower in path_lower:
                 score += 3.0
 
             # Word matches
@@ -783,17 +798,22 @@ def find_routes(topic, limit=10):
                     score += 2.0
                 if word in desc:
                     score += 1.0
-                if word in path:
+                if word in path_lower:
                     score += 0.5
 
             if score > 0:
+                path_exists = entry_path in valid_paths
+                # Skip invalid paths if validation is enabled
+                if validate_paths and not path_exists:
+                    continue
                 matches.append({
                     "agents_path": node_path,
                     "label": entry.get("label", ""),
-                    "path": entry.get("path", ""),
+                    "path": entry_path,
                     "description": entry.get("description", ""),
                     "score": score,
                     "depth": depth,
+                    "path_exists": path_exists,
                 })
 
     # Sort by score descending, then depth ascending
