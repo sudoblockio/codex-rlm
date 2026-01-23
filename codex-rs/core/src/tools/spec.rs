@@ -723,6 +723,15 @@ fn create_test_sync_tool() -> ToolSpec {
 }
 
 fn create_grep_files_tool() -> ToolSpec {
+    create_grep_files_tool_with_name("grep_files")
+}
+
+/// Alias for grep_files (spec-defined name).
+fn create_grep_tool() -> ToolSpec {
+    create_grep_files_tool_with_name("grep")
+}
+
+fn create_grep_files_tool_with_name(name: &str) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "pattern".to_string(),
@@ -760,7 +769,7 @@ fn create_grep_files_tool() -> ToolSpec {
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "grep_files".to_string(),
+        name: name.to_string(),
         description: "Finds files whose contents match the pattern and lists them by modification \
                       time."
             .to_string(),
@@ -877,6 +886,15 @@ fn create_read_file_tool() -> ToolSpec {
 }
 
 fn create_list_dir_tool() -> ToolSpec {
+    create_list_dir_tool_with_name("list_dir")
+}
+
+/// Alias for list_dir (spec-defined name).
+fn create_glob_tool() -> ToolSpec {
+    create_list_dir_tool_with_name("glob")
+}
+
+fn create_list_dir_tool_with_name(name: &str) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "dir_path".to_string(),
@@ -909,7 +927,7 @@ fn create_list_dir_tool() -> ToolSpec {
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "list_dir".to_string(),
+        name: name.to_string(),
         description:
             "Lists entries in a local directory with 1-indexed entry numbers and simple type labels."
                 .to_string(),
@@ -1654,6 +1672,16 @@ pub(crate) fn build_specs(
         builder.register_handler("grep_files", grep_files_handler);
     }
 
+    // grep is an alias for grep_files (spec-defined name)
+    if config
+        .experimental_supported_tools
+        .contains(&"grep".to_string())
+    {
+        let grep_handler = Arc::new(GrepFilesHandler);
+        builder.push_spec_with_parallel_support(create_grep_tool(), true);
+        builder.register_handler("grep", grep_handler);
+    }
+
     if config
         .experimental_supported_tools
         .contains(&"read_file".to_string())
@@ -1671,6 +1699,17 @@ pub(crate) fn build_specs(
         let list_dir_handler = Arc::new(ListDirHandler);
         builder.push_spec_with_parallel_support(create_list_dir_tool(), true);
         builder.register_handler("list_dir", list_dir_handler);
+    }
+
+    // glob is an alias for list_dir (spec-defined name)
+    if config
+        .experimental_supported_tools
+        .iter()
+        .any(|tool| tool == "glob")
+    {
+        let glob_handler = Arc::new(ListDirHandler);
+        builder.push_spec_with_parallel_support(create_glob_tool(), true);
+        builder.register_handler("glob", glob_handler);
     }
 
     if config

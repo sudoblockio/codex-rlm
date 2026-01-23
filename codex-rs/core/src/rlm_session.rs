@@ -30,6 +30,8 @@ const DEFAULT_MAX_EXECUTION_MS: u64 = 30_000;
 const DEFAULT_MAX_FIND_RESULTS: u32 = 10_000;
 const HELPERS_LIMIT_BYTES: usize = 1024 * 1024;
 const MEMORY_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum total memory for context + index (512MB default, matching RlmConfig).
+const MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct RlmLimits {
@@ -125,12 +127,15 @@ pub(crate) enum RlmLoadMode {
 
 pub(crate) struct RlmSession {
     python: PythonRuntime,
-    context: String,
+    /// Context string wrapped in Arc to avoid cloning on every exec.
+    context: Arc<String>,
     sources: Vec<String>,
     documents: Vec<DocumentMetadata>,
     routing_graph: Option<HierarchicalRoutingGraph>,
     helpers: Vec<RlmHelper>,
     memory: BTreeMap<String, serde_json::Value>,
+    /// Cached memory bytes used (updated incrementally on put/clear).
+    memory_bytes_cached: usize,
     limits: RlmLimits,
     budget_state: Arc<StdMutex<BudgetSnapshot>>,
     context_loaded: bool,
@@ -147,12 +152,13 @@ impl RlmSession {
         python.set_resource_limits(Self::resource_limits_for(&limits))?;
         Ok(Self {
             python,
-            context: String::new(),
+            context: Arc::new(String::new()),
             sources: Vec::new(),
             documents: Vec::new(),
             routing_graph: None,
             helpers: Vec::new(),
             memory: BTreeMap::new(),
+            memory_bytes_cached: 0,
             limits,
             budget_state: Arc::new(StdMutex::new(budget)),
             context_loaded: false,
@@ -201,11 +207,23 @@ impl RlmSession {
         }
 
         let path_label = path.to_string_lossy().to_string();
-        if matches!(mode, RlmLoadMode::Append) && self.context_loaded {
-            self.context
-                .push_str(&format!("\n\n===== APPENDED: {path_label} =====\n\n"));
-        }
-        self.context.push_str(&loaded.content);
+
+        // Build new context string (we need to create a new Arc when content changes)
+        let new_context = if matches!(mode, RlmLoadMode::Append) && self.context_loaded {
+            let mut ctx = String::with_capacity(
+                self.context.len() + loaded.content.len() + path_label.len() + 50,
+            );
+            ctx.push_str(&self.context);
+            ctx.push_str(&format!("\n\n===== APPENDED: {path_label} =====\n\n"));
+            ctx.push_str(&loaded.content);
+            ctx
+        } else {
+            loaded.content
+        };
+        self.context = Arc::new(new_context);
+
+        // Enforce total memory limit before proceeding
+        self.enforce_total_memory_limit()?;
 
         self.sources.push(path_label);
         self.documents.extend(loaded.documents);
@@ -233,9 +251,10 @@ impl RlmSession {
             self.python.set_llm_callback(callback)?;
         }
         // Set up search callback for BM25 search from Python
+        // Uses Arc::clone to share context without copying
         let search_callback = Arc::new(RlmSearchCallback::new(
             self.bm25_index_shared(),
-            self.context.clone(),
+            Arc::clone(&self.context),
         ));
         self.python.set_search_callback(search_callback)?;
         if let Some(policy_json) = tool_override_policy_json {
@@ -257,8 +276,41 @@ impl RlmSession {
     }
 
     pub(crate) fn memory_put(&mut self, key: String, value: serde_json::Value) -> Result<()> {
-        self.memory.insert(key, value);
-        self.enforce_memory_limit()?;
+        // Calculate size of new value
+        let new_value_size = serde_json::to_string(&value)
+            .map(|json| json.len())
+            .unwrap_or(0);
+        let new_entry_size = key.len() + new_value_size;
+
+        // Calculate size of old value if replacing
+        let old_entry_size = self.memory.get(&key).map(|old_value| {
+            let old_value_size = serde_json::to_string(old_value)
+                .map(|json| json.len())
+                .unwrap_or(0);
+            key.len() + old_value_size
+        });
+
+        // Update cache with delta
+        let old_cached = self.memory_bytes_cached;
+        self.memory_bytes_cached = self
+            .memory_bytes_cached
+            .saturating_sub(old_entry_size.unwrap_or(0))
+            + new_entry_size;
+
+        let old_value = self.memory.insert(key.clone(), value);
+        if let Err(err) = self.enforce_memory_limit() {
+            // Rollback: restore old value or remove the key, and restore cache
+            self.memory_bytes_cached = old_cached;
+            match old_value {
+                Some(v) => {
+                    self.memory.insert(key, v);
+                }
+                None => {
+                    self.memory.remove(&key);
+                }
+            }
+            return Err(err);
+        }
         self.refresh_session_manifest()?;
         Ok(())
     }
@@ -273,6 +325,7 @@ impl RlmSession {
 
     pub(crate) fn memory_clear(&mut self) -> Result<()> {
         self.memory.clear();
+        self.memory_bytes_cached = 0;
         self.refresh_session_manifest()?;
         Ok(())
     }
@@ -289,15 +342,7 @@ impl RlmSession {
     }
 
     pub(crate) fn memory_bytes_used(&self) -> usize {
-        self.memory
-            .iter()
-            .map(|(key, value)| {
-                let value_size = serde_json::to_string(value)
-                    .map(|json| json.len())
-                    .unwrap_or(0);
-                key.len() + value_size
-            })
-            .sum()
+        self.memory_bytes_cached
     }
 
     pub(crate) fn helpers_add(&mut self, name: String, code: String) -> Result<()> {
@@ -333,7 +378,7 @@ impl RlmSession {
     }
 
     pub(crate) fn context(&self) -> &str {
-        &self.context
+        &*self.context
     }
 
     pub(crate) fn has_routing(&self) -> bool {
@@ -349,10 +394,11 @@ impl RlmSession {
 
     pub(crate) fn bm25_search(&mut self, query: &str, k: usize) -> Vec<SearchResult> {
         self.ensure_bm25_index();
+        let context = &*self.context;
         self.bm25_index
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().map(|index| index.search(query, k)))
+            .and_then(|guard| guard.as_ref().map(|index| index.search(query, k, context)))
             .unwrap_or_default()
     }
 
@@ -398,18 +444,48 @@ impl RlmSession {
         Ok(())
     }
 
+    /// Estimate total memory usage for context + BM25 index.
+    ///
+    /// The BM25 index roughly doubles the context size due to chunking with overlap
+    /// and internal data structures.
+    fn estimate_total_memory(&self) -> usize {
+        let context_bytes = self.context.len();
+        // BM25 index is estimated at ~2x context size when built
+        let index_estimate = if self.bm25_index.lock().ok().and_then(|g| g.as_ref().map(|_| ())).is_some() {
+            context_bytes * 2
+        } else {
+            // Index will be built on first search, so account for it
+            context_bytes * 2
+        };
+        context_bytes + index_estimate
+    }
+
+    /// Enforce the total memory limit (context + index).
+    fn enforce_total_memory_limit(&self) -> Result<()> {
+        let used = self.estimate_total_memory();
+        if used > MAX_MEMORY_BYTES {
+            let used_mb = used / (1024 * 1024);
+            let limit_mb = MAX_MEMORY_BYTES / (1024 * 1024);
+            anyhow::bail!(
+                "context_too_large: estimated memory {used_mb}MB exceeds limit {limit_mb}MB"
+            );
+        }
+        Ok(())
+    }
+
     fn reset_state(&mut self) -> Result<()> {
         let config = RlmConfig::default();
         let mut python = PythonRuntime::new()?;
         python.set_allowed_modules(&config.safety.allowed_modules)?;
         python.set_resource_limits(Self::resource_limits_for(&self.limits))?;
         self.python = python;
-        self.context.clear();
+        self.context = Arc::new(String::new());
         self.sources.clear();
         self.documents.clear();
         self.routing_graph = None;
         self.helpers.clear();
         self.memory.clear();
+        self.memory_bytes_cached = 0;
         if let Ok(mut guard) = self.budget_state.lock() {
             *guard = Self::budget_from_config(&config);
         }
@@ -421,6 +497,9 @@ impl RlmSession {
     fn refresh_python_context(&mut self) -> Result<()> {
         self.python.set_context(&self.context)?;
         self.python.set_document_list(&self.documents)?;
+        // Set metadata for stats() builtin
+        self.python
+            .set_context_metadata(&self.sources, self.documents.len().max(1))?;
         if let Some(graph) = self.routing_graph.clone() {
             self.python.set_hierarchical_routing(&graph)?;
         } else {
@@ -466,7 +545,14 @@ impl RlmSession {
         if self.helpers.is_empty() {
             return code.to_string();
         }
-        let mut combined = String::new();
+        // Pre-calculate total capacity: each helper contributes code + up to 2 newlines
+        let capacity = self
+            .helpers
+            .iter()
+            .map(|h| h.code.len() + 2)
+            .sum::<usize>()
+            + code.len();
+        let mut combined = String::with_capacity(capacity);
         for helper in &self.helpers {
             combined.push_str(&helper.code);
             if !helper.code.ends_with('\n') {
@@ -548,11 +634,8 @@ pub(crate) struct RlmSearchCallback {
 }
 
 impl RlmSearchCallback {
-    pub(crate) fn new(index: Arc<StdMutex<Option<Bm25Index>>>, context: String) -> Self {
-        Self {
-            index,
-            context: Arc::new(context),
-        }
+    pub(crate) fn new(index: Arc<StdMutex<Option<Bm25Index>>>, context: Arc<String>) -> Self {
+        Self { index, context }
     }
 
     fn ensure_index(&self) {
@@ -576,7 +659,7 @@ impl SearchCallback for RlmSearchCallback {
             .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
         let results = guard
             .as_ref()
-            .map(|index| index.search(query, k))
+            .map(|index| index.search(query, k, &self.context))
             .unwrap_or_default();
         Ok(results.into_iter().map(SearchResultJson::from).collect())
     }
@@ -675,9 +758,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Create search callback
-        let callback =
-            RlmSearchCallback::new(session.bm25_index_shared(), session.context().to_string());
+        // Create search callback with context wrapped in Arc
+        let context = Arc::new(session.context().to_string());
+        let callback = RlmSearchCallback::new(session.bm25_index_shared(), context);
 
         // Search for "fox"
         let results = callback.search("fox", 5).unwrap();
@@ -945,5 +1028,411 @@ mod tests {
         assert_eq!(outcome.limits_applied.max_output_bytes, 1024);
         assert_eq!(outcome.limits_applied.max_execution_ms, 5000);
         assert_eq!(outcome.limits_applied.max_find_results, 100);
+    }
+
+    // Integration tests for full tool flow
+
+    #[tokio::test]
+    async fn full_load_exec_roundtrip_with_builtins() {
+        let mut session = RlmSession::new().unwrap();
+        let content = "Hello World! This is a test document with some content.";
+        let file = write_temp_file(content);
+
+        // Load context
+        let stats = session
+            .load_path(file.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+        assert!(stats.length_chars > 0);
+        assert!(session.has_context());
+
+        // Execute code using builtins
+        let outcome = session
+            .exec(
+                r#"
+text = peek(0, 5)
+matches = find(r'World')
+result = {'text': text, 'match_count': len(matches)}
+"#,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(outcome.result.error.is_none(), "exec should succeed");
+        let result: serde_json::Value =
+            serde_json::from_str(&outcome.result.result_json.unwrap()).unwrap();
+        assert_eq!(result["text"], "Hello");
+        assert_eq!(result["match_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn load_append_exec_preserves_all_state() {
+        let mut session = RlmSession::new().unwrap();
+        let file1 = write_temp_file("First document content.");
+        let file2 = write_temp_file("Second document content.");
+
+        // Load first file
+        session
+            .load_path(file1.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+
+        // Add helper
+        session
+            .helpers_add(
+                "count_words".to_string(),
+                "def count_words(text):\n    return len(text.split())\n".to_string(),
+            )
+            .unwrap();
+
+        // Store in memory
+        session
+            .memory_put("pass1_result".to_string(), serde_json::json!({"count": 3}))
+            .unwrap();
+
+        // Append second file
+        let stats = session
+            .load_path(file2.path(), RlmLoadMode::Append)
+            .await
+            .unwrap();
+        assert_eq!(stats.sources.len(), 2);
+
+        // Verify helper still works
+        let outcome = session
+            .exec("result = count_words('a b c d e')", None, None, None)
+            .unwrap();
+        assert!(outcome.result.error.is_none());
+        let result: i32 = serde_json::from_str(&outcome.result.result_json.unwrap()).unwrap();
+        assert_eq!(result, 5);
+
+        // Verify memory persists
+        assert_eq!(
+            session.memory_get("pass1_result"),
+            Some(serde_json::json!({"count": 3}))
+        );
+
+        // Verify context contains both documents
+        assert!(session.context().contains("First document"));
+        assert!(session.context().contains("Second document"));
+    }
+
+    #[tokio::test]
+    async fn exec_search_builtin_returns_results() {
+        let mut session = RlmSession::new().unwrap();
+        let content = "The quick brown fox jumps over the lazy dog. \
+                       The fox is very quick. \
+                       Dogs are loyal animals.";
+        let file = write_temp_file(content);
+
+        session
+            .load_path(file.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+
+        let outcome = session
+            .exec(
+                r#"
+results = search("fox", k=5)
+result = {'count': len(results), 'has_fox': any('fox' in r['text'].lower() for r in results)}
+"#,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(outcome.result.error.is_none());
+        let result: serde_json::Value =
+            serde_json::from_str(&outcome.result.result_json.unwrap()).unwrap();
+        assert!(result["count"].as_i64().unwrap() > 0);
+        assert_eq!(result["has_fox"], true);
+    }
+
+    #[tokio::test]
+    async fn exec_stats_and_session_builtins_work() {
+        let mut session = RlmSession::new().unwrap();
+        let content = "Line 1\nLine 2\nLine 3\n";
+        let file = write_temp_file(content);
+
+        session
+            .load_path(file.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+
+        let outcome = session
+            .exec(
+                r#"
+s = stats()
+sess = session()
+result = {
+    'chars': s['chars'],
+    'lines': s['lines'],
+    'docs': s['docs'],
+    'has_sources': len(s['sources']) > 0
+}
+"#,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            outcome.result.error.is_none(),
+            "exec failed: {:?} traceback: {:?}",
+            outcome.result.error,
+            outcome.result.traceback
+        );
+        let result: serde_json::Value =
+            serde_json::from_str(&outcome.result.result_json.unwrap()).unwrap();
+        assert!(result["chars"].as_i64().unwrap() > 0);
+        // Content is "Line 1\nLine 2\nLine 3\n" which has 3 newlines, so 4 lines
+        assert_eq!(result["lines"], 4);
+        assert_eq!(result["docs"], 1);
+        assert_eq!(result["has_sources"], true);
+    }
+
+    #[tokio::test]
+    async fn multiple_exec_calls_share_state() {
+        let mut session = RlmSession::new().unwrap();
+        let file = write_temp_file("test content");
+
+        session
+            .load_path(file.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+
+        // First exec: define a value in memory via helper
+        session
+            .helpers_add(
+                "store".to_string(),
+                "stored_value = 42\n".to_string(),
+            )
+            .unwrap();
+
+        // First exec: use the helper
+        let outcome1 = session
+            .exec("result = stored_value", None, None, None)
+            .unwrap();
+        assert!(outcome1.result.error.is_none());
+        let result1: i32 = serde_json::from_str(&outcome1.result.result_json.unwrap()).unwrap();
+        assert_eq!(result1, 42);
+
+        // Second exec: modify and return
+        let outcome2 = session
+            .exec("result = stored_value * 2", None, None, None)
+            .unwrap();
+        assert!(outcome2.result.error.is_none());
+        let result2: i32 = serde_json::from_str(&outcome2.result.result_json.unwrap()).unwrap();
+        assert_eq!(result2, 84);
+    }
+
+    #[tokio::test]
+    async fn budget_is_tracked_across_exec_calls() {
+        let mut session = RlmSession::new().unwrap();
+        let file = write_temp_file("test");
+
+        session
+            .load_path(file.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+
+        let initial_budget = session.budget_snapshot();
+
+        // Execute some code
+        session.exec("x = 1 + 1", None, None, None).unwrap();
+
+        // Budget should still be available (no sub-agent calls)
+        let after_budget = session.budget_snapshot();
+        assert_eq!(
+            initial_budget.remaining_sub_calls,
+            after_budget.remaining_sub_calls
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_load_clears_budget() {
+        let mut session = RlmSession::new().unwrap();
+        let file1 = write_temp_file("first");
+        let file2 = write_temp_file("second");
+
+        session
+            .load_path(file1.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+
+        let budget1 = session.budget_snapshot();
+
+        // Reset with new file should reset budget
+        session
+            .load_path(file2.path(), RlmLoadMode::Reset)
+            .await
+            .unwrap();
+
+        let budget2 = session.budget_snapshot();
+
+        // Budget should be fresh (same as initial)
+        assert_eq!(budget1.remaining_sub_calls, budget2.remaining_sub_calls);
+        assert_eq!(budget1.remaining_tokens, budget2.remaining_tokens);
+    }
+
+    // Helper and memory limit enforcement tests
+
+    #[test]
+    fn helper_limit_is_enforced() {
+        let mut session = RlmSession::new().unwrap();
+
+        // Try to add a helper that's too large (over 1MB)
+        let large_code = "x = ".to_string() + &"0".repeat(HELPERS_LIMIT_BYTES + 100);
+        let result = session.helpers_add("big".to_string(), large_code);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("helper limit exceeded"));
+    }
+
+    #[test]
+    fn helper_limit_accumulates_across_helpers() {
+        let mut session = RlmSession::new().unwrap();
+
+        // Add several helpers that together exceed the limit
+        let half_limit = HELPERS_LIMIT_BYTES / 2;
+        let code1 = "a = ".to_string() + &"1".repeat(half_limit);
+        let code2 = "b = ".to_string() + &"2".repeat(half_limit);
+
+        // First helper should succeed
+        session.helpers_add("h1".to_string(), code1).unwrap();
+
+        // Second helper should fail (total exceeds limit)
+        let result = session.helpers_add("h2".to_string(), code2);
+        assert!(result.is_err());
+
+        // Original helper should still be present
+        assert_eq!(session.helpers_list(), vec!["h1".to_string()]);
+    }
+
+    #[test]
+    fn memory_limit_is_enforced() {
+        let mut session = RlmSession::new().unwrap();
+
+        // Try to add a memory value that's too large (over 5MB)
+        let large_string = "x".repeat(MEMORY_LIMIT_BYTES + 100);
+        let result = session.memory_put("big".to_string(), serde_json::json!(large_string));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("memory limit exceeded"));
+    }
+
+    #[test]
+    fn memory_limit_accumulates_across_keys() {
+        let mut session = RlmSession::new().unwrap();
+
+        // Add several memory entries that together exceed the limit
+        let half_limit = MEMORY_LIMIT_BYTES / 2;
+        let value1 = "a".repeat(half_limit);
+        let value2 = "b".repeat(half_limit);
+
+        // First value should succeed
+        session
+            .memory_put("k1".to_string(), serde_json::json!(value1))
+            .unwrap();
+
+        // Second value should fail (total exceeds limit)
+        let result = session.memory_put("k2".to_string(), serde_json::json!(value2));
+        assert!(result.is_err());
+
+        // Original value should still be present
+        assert!(session.memory_get("k1").is_some());
+        assert!(session.memory_get("k2").is_none());
+    }
+
+    #[test]
+    fn helper_removal_frees_space() {
+        let mut session = RlmSession::new().unwrap();
+
+        // Add a large helper
+        let large_code = "x = ".to_string() + &"0".repeat(HELPERS_LIMIT_BYTES - 1000);
+        session.helpers_add("large".to_string(), large_code).unwrap();
+
+        // Try to add another - should fail
+        let small_code = "y = ".to_string() + &"1".repeat(2000);
+        assert!(session
+            .helpers_add("small".to_string(), small_code.clone())
+            .is_err());
+
+        // Remove the large helper
+        session.helpers_remove("large").unwrap();
+
+        // Now the small one should succeed
+        session.helpers_add("small".to_string(), small_code).unwrap();
+        assert_eq!(session.helpers_list(), vec!["small".to_string()]);
+    }
+
+    #[test]
+    fn memory_clear_frees_space() {
+        let mut session = RlmSession::new().unwrap();
+
+        // Fill memory near the limit
+        let large_value = "x".repeat(MEMORY_LIMIT_BYTES - 1000);
+        session
+            .memory_put("large".to_string(), serde_json::json!(large_value))
+            .unwrap();
+
+        // Try to add more - should fail
+        let small_value = "y".repeat(2000);
+        assert!(session
+            .memory_put("small".to_string(), serde_json::json!(small_value.clone()))
+            .is_err());
+
+        // Clear memory
+        session.memory_clear().unwrap();
+
+        // Now we can add again
+        session
+            .memory_put("small".to_string(), serde_json::json!(small_value))
+            .unwrap();
+        assert!(session.memory_get("small").is_some());
+    }
+
+    #[test]
+    fn helpers_bytes_used_is_accurate() {
+        let mut session = RlmSession::new().unwrap();
+
+        let name1 = "helper1";
+        let code1 = "def f(): return 1";
+        session.helpers_add(name1.to_string(), code1.to_string()).unwrap();
+
+        let expected = name1.len() + code1.len();
+        assert_eq!(session.helpers_bytes_used(), expected);
+
+        let name2 = "helper2";
+        let code2 = "def g(): return 2";
+        session.helpers_add(name2.to_string(), code2.to_string()).unwrap();
+
+        let expected2 = expected + name2.len() + code2.len();
+        assert_eq!(session.helpers_bytes_used(), expected2);
+    }
+
+    #[test]
+    fn memory_bytes_used_is_accurate() {
+        let mut session = RlmSession::new().unwrap();
+
+        session
+            .memory_put("key1".to_string(), serde_json::json!("value1"))
+            .unwrap();
+
+        // key1 = 4 bytes, "value1" serialized = "\"value1\"" = 8 bytes
+        let used1 = session.memory_bytes_used();
+        assert!(used1 > 0);
+
+        session
+            .memory_put("key2".to_string(), serde_json::json!({"nested": true}))
+            .unwrap();
+
+        let used2 = session.memory_bytes_used();
+        assert!(used2 > used1);
     }
 }

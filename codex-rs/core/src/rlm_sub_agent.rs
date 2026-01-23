@@ -8,6 +8,7 @@ use anyhow::anyhow;
 use codex_rlm::BudgetSnapshot;
 use codex_rlm::error::BudgetExceededKind;
 use codex_rlm::estimate_tokens;
+use codex_rlm::python::BatchCallResult;
 use codex_rlm::python::LlmCallback;
 use serde::Serialize;
 use tokio::time::timeout;
@@ -21,7 +22,8 @@ use crate::function_tool::FunctionCallError;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::openai_models::ConfigShellToolType;
 
-const DEFAULT_SUB_AGENT_TOOLS: [&str; 3] = ["read_file", "list_dir", "grep_files"];
+/// Default tools for sub-agents: read_file, glob, grep (read-only, spec-defined names)
+const DEFAULT_SUB_AGENT_TOOLS: [&str; 3] = ["read_file", "glob", "grep"];
 const SUB_AGENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -331,7 +333,7 @@ impl LlmCallback for RlmSubAgentCallback {
         Ok(output)
     }
 
-    fn batch(&self, prompts: Vec<String>) -> Result<Vec<String>> {
+    fn batch(&self, prompts: Vec<String>, max_concurrent: usize) -> Result<Vec<BatchCallResult>> {
         if prompts.is_empty() {
             return Ok(Vec::new());
         }
@@ -347,18 +349,51 @@ impl LlmCallback for RlmSubAgentCallback {
         let turn = Arc::clone(&self.turn);
         let tool_allowlist = default_sub_agent_tools();
         let start = Instant::now();
-        let outputs = self
-            .runtime_handle
-            .block_on(async {
-                let mut results = Vec::with_capacity(prompts.len());
-                for prompt in prompts {
-                    let output =
-                        run_sub_agent(&session, &turn, prompt, tool_allowlist.clone()).await?;
-                    results.push(output);
+
+        // Run sub-agents with concurrency limit
+        let results = self.runtime_handle.block_on(async {
+            use tokio::sync::Semaphore;
+
+            let semaphore = Arc::new(Semaphore::new(max_concurrent.max(1)));
+
+            let futures: Vec<_> = prompts
+                .into_iter()
+                .map(|prompt| {
+                    let session = Arc::clone(&session);
+                    let turn = Arc::clone(&turn);
+                    let tool_allowlist = tool_allowlist.clone();
+                    let semaphore = Arc::clone(&semaphore);
+                    async move {
+                        let _permit = semaphore.acquire().await;
+                        run_sub_agent(&session, &turn, prompt, tool_allowlist).await
+                    }
+                })
+                .collect();
+
+            // Execute all futures concurrently (respecting semaphore limit)
+            futures::future::join_all(futures).await
+        });
+
+        // Convert each result to BatchCallResult
+        let outputs: Vec<BatchCallResult> = results
+            .into_iter()
+            .map(|result| match result {
+                Ok(response) => BatchCallResult::success(response),
+                Err(err) => {
+                    // Categorize the error
+                    let err_str = err.to_string();
+                    let (code, retriable) = if err_str.contains("timeout") || err_str.contains("timed out")
+                    {
+                        ("timeout", true)
+                    } else if err_str.contains("budget") {
+                        ("budget_exceeded", false)
+                    } else {
+                        ("sub_agent_error", true)
+                    };
+                    BatchCallResult::error(code, err_str, retriable)
                 }
-                Ok::<_, FunctionCallError>(results)
             })
-            .map_err(|err| anyhow!(err.to_string()))?;
+            .collect();
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
         self.charge_time(elapsed_ms)?;
@@ -535,11 +570,118 @@ mod tests {
     #[test]
     fn default_sub_agent_tools_are_read_only() {
         let tools = default_sub_agent_tools();
+        // Default read-only tools: read_file, glob, grep (spec-defined names)
         assert!(tools.contains(&"read_file".to_string()));
-        assert!(tools.contains(&"list_dir".to_string()));
-        assert!(tools.contains(&"grep_files".to_string()));
+        assert!(tools.contains(&"glob".to_string()));
+        assert!(tools.contains(&"grep".to_string()));
         // Should NOT contain write tools
         assert!(!tools.contains(&"shell".to_string()));
         assert!(!tools.contains(&"apply_patch".to_string()));
+    }
+
+    #[test]
+    fn concurrent_budget_reservations_are_atomic() {
+        // Test that concurrent budget reservations don't corrupt state
+        use std::thread;
+
+        let budget = BudgetSnapshot::new(10000, 100, 100, 60000);
+        let budget_state = Arc::new(StdMutex::new(budget));
+
+        // Spawn 10 threads, each making 10 reservations of 1 sub_call
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let state = Arc::clone(&budget_state);
+                thread::spawn(move || {
+                    for _ in 0..10 {
+                        let _ = reserve_budget(&state, 10, 1);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Should have used exactly 100 sub_calls (10 threads × 10 calls)
+        let snapshot = budget_state.lock().unwrap().clone();
+        assert_eq!(snapshot.remaining_sub_calls, 0);
+        assert_eq!(snapshot.remaining_tokens, 9000); // 10000 - (100 × 10)
+    }
+
+    #[test]
+    fn concurrent_budget_exhaustion_is_safe() {
+        // Test that concurrent reservations don't go negative when budget is limited
+        use std::thread;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let budget = BudgetSnapshot::new(10000, 5, 100, 60000);
+        let budget_state = Arc::new(StdMutex::new(budget));
+        let success_count = Arc::new(AtomicU32::new(0));
+
+        // Spawn 10 threads, each trying to reserve 1 sub_call
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let state = Arc::clone(&budget_state);
+                let counter = Arc::clone(&success_count);
+                thread::spawn(move || {
+                    if reserve_budget(&state, 10, 1).is_ok() {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Exactly 5 should succeed (the budget limit)
+        assert_eq!(success_count.load(Ordering::SeqCst), 5);
+
+        // Budget should not go negative
+        let snapshot = budget_state.lock().unwrap().clone();
+        assert_eq!(snapshot.remaining_sub_calls, 0);
+    }
+
+    #[test]
+    fn concurrent_time_charging_is_atomic() {
+        use std::thread;
+
+        let budget = BudgetSnapshot::new(10000, 100, 100, 10000);
+        let budget_state = Arc::new(StdMutex::new(budget));
+
+        // Spawn 10 threads, each charging 100ms
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let state = Arc::clone(&budget_state);
+                thread::spawn(move || {
+                    charge_time(&state, 100).unwrap();
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Should have charged exactly 1000ms
+        let snapshot = budget_state.lock().unwrap().clone();
+        assert_eq!(snapshot.remaining_ms, 9000);
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_reserves_budget_atomically() {
+        // Verify that batch budget reservation happens before parallel execution starts
+        let budget = BudgetSnapshot::new(1000, 5, 100, 60000);
+        let budget_state = Arc::new(StdMutex::new(budget));
+
+        // Reserve for a batch of 3 prompts
+        reserve_budget(&budget_state, 300, 3).unwrap();
+
+        // After reservation, budget should reflect all 3 sub_calls
+        let snapshot = budget_state.lock().unwrap().clone();
+        assert_eq!(snapshot.remaining_sub_calls, 2);
+        assert_eq!(snapshot.remaining_tokens, 700);
     }
 }

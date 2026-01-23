@@ -28,6 +28,8 @@ pub struct BudgetSnapshot {
     pub remaining_tokens: u64,
     pub remaining_sub_calls: u32,
     pub remaining_tool_calls: u32,
+    /// Serialized as `remaining_time_ms` per spec.
+    #[serde(rename = "remaining_time_ms")]
     pub remaining_ms: u64,
 }
 
