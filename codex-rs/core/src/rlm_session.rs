@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use anyhow::Result;
+use sha2::Digest;
+use sha2::Sha256;
 use codex_rlm::BudgetSnapshot;
 use codex_rlm::RlmConfig;
 use codex_rlm::context::ContextSource;
@@ -85,6 +87,8 @@ pub(crate) struct RlmLoadStats {
     pub(crate) has_routing: bool,
     pub(crate) routing_entry_count: usize,
     pub(crate) sources: Vec<String>,
+    /// SHA256 hash of the context for determinism verification and replay.
+    pub(crate) context_hash: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -184,6 +188,14 @@ impl RlmSession {
             .as_ref()
             .map(|graph| (graph.total_entries() > 0, graph.total_entries()))
             .unwrap_or((false, 0));
+
+        // Compute SHA256 hash for determinism verification and replay
+        let context_hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(self.context.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
         RlmLoadStats {
             length_chars,
             length_tokens_estimate,
@@ -192,6 +204,7 @@ impl RlmSession {
             has_routing,
             routing_entry_count,
             sources: self.sources.clone(),
+            context_hash,
         }
     }
 
@@ -880,14 +893,16 @@ mod tests {
         let result: String = serde_json::from_str(&outcome.result.result_json.unwrap()).unwrap();
         assert_eq!(result, "quick");
 
-        // Test find
+        // Test find - now returns {"matches": [...], "capped": bool}
         let outcome = session
             .exec("result = find(r'\\b\\w+ox\\b')", None, None, None)
             .unwrap();
         assert!(outcome.result.error.is_none());
-        let matches: Vec<(usize, usize)> =
+        let find_result: serde_json::Value =
             serde_json::from_str(&outcome.result.result_json.unwrap()).unwrap();
+        let matches = find_result["matches"].as_array().unwrap();
         assert!(!matches.is_empty());
+        assert_eq!(find_result["capped"], false);
     }
 
     #[tokio::test]
@@ -1047,12 +1062,13 @@ mod tests {
         assert!(session.has_context());
 
         // Execute code using builtins
+        // find() now returns {"matches": [...], "capped": bool}
         let outcome = session
             .exec(
                 r#"
 text = peek(0, 5)
-matches = find(r'World')
-result = {'text': text, 'match_count': len(matches)}
+find_result = find(r'World')
+result = {'text': text, 'match_count': len(find_result['matches']), 'capped': find_result['capped']}
 "#,
                 None,
                 None,
@@ -1065,6 +1081,7 @@ result = {'text': text, 'match_count': len(matches)}
             serde_json::from_str(&outcome.result.result_json.unwrap()).unwrap();
         assert_eq!(result["text"], "Hello");
         assert_eq!(result["match_count"], 1);
+        assert_eq!(result["capped"], false);
     }
 
     #[tokio::test]
