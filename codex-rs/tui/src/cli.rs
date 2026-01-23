@@ -98,6 +98,21 @@ pub struct Cli {
     #[arg(long = "search", default_value_t = false)]
     pub web_search: bool,
 
+    /// Enable RLM (Recursive Language Model) mode for processing large contexts.
+    #[cfg(feature = "rlm")]
+    #[arg(long = "rlm", default_value_t = false)]
+    pub rlm: bool,
+
+    /// Path to file or directory to load as RLM context.
+    #[cfg(feature = "rlm")]
+    #[arg(long = "rlm-context", value_name = "PATH", conflicts_with = "rlm_text")]
+    pub rlm_context: Option<std::path::PathBuf>,
+
+    /// Direct text to use as RLM context.
+    #[cfg(feature = "rlm")]
+    #[arg(long = "rlm-text", value_name = "TEXT", conflicts_with = "rlm_context")]
+    pub rlm_text: Option<String>,
+
     /// Additional directories that should be writable alongside the primary workspace.
     #[arg(long = "add-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
     pub add_dir: Vec<PathBuf>,

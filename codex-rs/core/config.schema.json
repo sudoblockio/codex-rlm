@@ -130,6 +130,14 @@
         "experimental_compact_prompt_file": {
           "$ref": "#/definitions/AbsolutePathBuf"
         },
+        "experimental_supported_tools": {
+          "default": null,
+          "description": "Additional tools to enable (e.g., [\"rlm_load\", \"rlm_exec\"]).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "experimental_use_freeform_apply_patch": {
           "type": "boolean"
         },
@@ -793,6 +801,89 @@
         }
       ]
     },
+    "RlmConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "gateway": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RlmGatewayConfigToml"
+            }
+          ],
+          "description": "Optional gateway configuration for the RLM runtime."
+        },
+        "prompt": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RlmPromptConfigToml"
+            }
+          ],
+          "description": "Optional prompt template overrides for the RLM runtime."
+        },
+        "sub_agent_policy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RlmSubAgentPolicyToml"
+            }
+          ],
+          "description": "Optional sub-agent policy overrides for RLM tool calls."
+        }
+      },
+      "type": "object"
+    },
+    "RlmGatewayConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "api_key": {
+          "type": "string"
+        },
+        "api_key_env": {
+          "type": "string"
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "max_output_tokens": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "wire_api": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RlmPromptConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "template": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RlmSubAgentPolicyToml": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_tool_overrides": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "require_approval": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "SandboxMode": {
       "enum": [
         "read-only",
@@ -1178,6 +1269,14 @@
     "experimental_compact_prompt_file": {
       "$ref": "#/definitions/AbsolutePathBuf"
     },
+    "experimental_supported_tools": {
+      "default": null,
+      "description": "User-configured experimental tools (e.g., [\"rlm_load\", \"rlm_exec\"]).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "experimental_use_freeform_apply_patch": {
       "type": "boolean"
     },
@@ -1476,6 +1575,14 @@
     "review_model": {
       "description": "Review model override used by the `/review` feature.",
       "type": "string"
+    },
+    "rlm": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RlmConfigToml"
+        }
+      ],
+      "description": "RLM runtime settings."
     },
     "sandbox_mode": {
       "allOf": [
