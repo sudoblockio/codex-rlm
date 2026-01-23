@@ -66,6 +66,8 @@ pub struct ExecutionResult {
     pub result_json_error: Option<String>,
     pub tool_override_events_json: Option<String>,
     pub tool_override_denied: bool,
+    /// List of document IDs accessed during execution (via peek, peek_doc, etc.)
+    pub files_accessed: Vec<String>,
 }
 
 pub trait LlmCallback: Send + Sync {
@@ -387,6 +389,13 @@ impl PythonRuntime {
                 .and_then(|item| item.extract::<Option<bool>>().ok())
                 .flatten()
                 .unwrap_or(false);
+            // Extract files_accessed from _state (stored as JSON by _exec_wrapper)
+            let files_accessed: Vec<String> = locals
+                .get_item("_files_accessed_json")?
+                .and_then(|item| item.extract::<Option<String>>().ok())
+                .flatten()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
             let _ = locals.del_item("_output");
             let _ = locals.del_item("_error");
             let _ = locals.del_item("_traceback");
@@ -411,6 +420,7 @@ impl PythonRuntime {
                 result_json_error,
                 tool_override_events_json,
                 tool_override_denied,
+                files_accessed,
             })
         })
     }
@@ -494,11 +504,55 @@ def _parse_flags(flags):
     return value
 
 
+def _track_file_access(doc_id):
+    """Track that a document was accessed during execution."""
+    accessed = _state.get("_files_accessed")
+    if accessed is None:
+        accessed = set()
+        _state["_files_accessed"] = accessed
+    accessed.add(doc_id)
+
+
+def _find_doc_at_offset(offset):
+    """Find which document contains the given global offset."""
+    data = _state.get("document_list_json")
+    if not data:
+        return None
+    docs = json.loads(data)
+    for doc in docs:
+        doc_start = doc.get("start", 0)
+        doc_end = doc.get("end", doc_start + doc.get("size", 0))
+        if doc_start <= offset < doc_end:
+            return doc.get("id")
+    return None
+
+
+def files_accessed():
+    """Return list of document IDs accessed during this execution.
+
+    Returns:
+        list of document IDs that were read via peek, peek_doc, find, or search
+    """
+    accessed = _state.get("_files_accessed")
+    if not accessed:
+        return []
+    return sorted(accessed)
+
+
 def peek(start, end):
     """Peek at context using global byte offsets.
 
     Note: Returns a copy (Python string slice semantics).
     """
+    # Track which documents this range touches
+    doc_id = _find_doc_at_offset(start)
+    if doc_id:
+        _track_file_access(doc_id)
+    # Also check end in case it spans multiple docs
+    if end > start:
+        end_doc_id = _find_doc_at_offset(end - 1)
+        if end_doc_id and end_doc_id != doc_id:
+            _track_file_access(end_doc_id)
     return P[start:end]
 
 
@@ -538,6 +592,9 @@ def peek_doc(doc_id, start=0, end=None):
     global_start = doc_start + rel_start
     global_end = doc_start + rel_end
 
+    # Track file access
+    _track_file_access(doc_id)
+
     return P[global_start:global_end]
 
 
@@ -570,17 +627,55 @@ def stats():
     """Return context statistics per spec.
 
     Returns:
-        dict with keys: chars, tokens, lines, docs, sources
+        dict with keys: chars, tokens, lines, docs, sources, broken_links
     """
     sources = _state.get("sources") or []
     doc_count = _state.get("doc_count", 1)
-    return {
+
+    # Check for broken routing links
+    broken_links = []
+    routing_json = _state.get("hierarchical_routing_json")
+    doc_list_json = _state.get("document_list_json")
+
+    if routing_json and doc_list_json:
+        routing = json.loads(routing_json)
+        doc_list = json.loads(doc_list_json)
+
+        # Build set of valid paths
+        valid_paths = set()
+        for doc in doc_list:
+            doc_path = doc.get("path") or doc.get("id")
+            if doc_path:
+                valid_paths.add(doc_path)
+        # AGENTS.md files are also valid navigation targets
+        nodes = routing.get("nodes", {})
+        for node_path in nodes.keys():
+            valid_paths.add(node_path)
+
+        # Check all routing entries for broken links
+        for node_path, node in nodes.items():
+            for entry in node.get("entries", []):
+                entry_path = entry.get("path", "")
+                if entry_path and entry_path not in valid_paths:
+                    broken_links.append({
+                        "from": node_path,
+                        "path": entry_path,
+                        "label": entry.get("label", ""),
+                    })
+
+    result = {
         "chars": len(P),
         "tokens": max(1, len(P) // 4),
         "lines": P.count("\n") + 1,
         "docs": doc_count,
         "sources": sources,
     }
+
+    # Only include broken_links if there are any
+    if broken_links:
+        result["broken_links"] = broken_links
+
+    return result
 
 
 def _decode_json(key):
@@ -610,6 +705,65 @@ def routing():
 
 def routing_summary():
     return _state.get("routing_summary")
+
+
+def routing_coverage():
+    """Get coverage map of routing links vs loaded documents.
+
+    Returns:
+        dict with keys:
+        - total_links: Total number of routing entries
+        - loaded: List of paths that exist in loaded context
+        - missing: List of paths that don't exist (broken links)
+        - coverage_pct: Percentage of links that are loaded
+    """
+    routing_json = _state.get("hierarchical_routing_json")
+    doc_list_json = _state.get("document_list_json")
+
+    if not routing_json:
+        return {"total_links": 0, "loaded": [], "missing": [], "coverage_pct": 100.0}
+
+    routing = json.loads(routing_json)
+    nodes = routing.get("nodes", {})
+
+    # Build set of valid paths
+    valid_paths = set()
+    if doc_list_json:
+        doc_list = json.loads(doc_list_json)
+        for doc in doc_list:
+            doc_path = doc.get("path") or doc.get("id")
+            if doc_path:
+                valid_paths.add(doc_path)
+    # AGENTS.md files are also valid
+    for node_path in nodes.keys():
+        valid_paths.add(node_path)
+
+    # Collect all linked paths
+    loaded = []
+    missing = []
+    seen = set()
+
+    for node_path, node in nodes.items():
+        for entry in node.get("entries", []):
+            entry_path = entry.get("path", "")
+            if not entry_path or entry_path in seen:
+                continue
+            seen.add(entry_path)
+
+            if entry_path in valid_paths:
+                loaded.append(entry_path)
+            else:
+                missing.append(entry_path)
+
+    total = len(loaded) + len(missing)
+    coverage_pct = (len(loaded) / total * 100) if total > 0 else 100.0
+
+    return {
+        "total_links": total,
+        "loaded": sorted(loaded),
+        "missing": sorted(missing),
+        "coverage_pct": round(coverage_pct, 1),
+    }
 
 
 def _record_tool_override(tools, builtin="llm_query"):
@@ -1047,8 +1201,11 @@ else:
         for _k in list(_exec_globals.keys()):
             if _k.startswith('_') and _k not in ('__builtins__', '__name__', '__doc__'):
                 del _exec_globals[_k]
+        # Clear file access tracking for this execution
+        _state["_files_accessed"] = set()
         # Re-add the required helper functions
         _exec_globals['peek'] = peek
+        _exec_globals['files_accessed'] = files_accessed
         _exec_globals['find'] = find
         _exec_globals['stats'] = stats
         _exec_globals['policy'] = policy
@@ -1057,6 +1214,7 @@ else:
         _exec_globals['limits'] = limits
         _exec_globals['routing'] = routing
         _exec_globals['routing_summary'] = routing_summary
+        _exec_globals['routing_coverage'] = routing_coverage
         _exec_globals['llm_query'] = llm_query
         _exec_globals['llm_query_batch'] = llm_query_batch
         _exec_globals['search'] = search
@@ -1098,6 +1256,13 @@ else:
     _tool_override_denied = bool(_state.get("tool_override_denied", False))
     _state["tool_override_events"] = []
     _state["tool_override_denied"] = False
+
+    # Serialize files_accessed to JSON for Rust extraction
+    _files_accessed = _state.get("_files_accessed")
+    if _files_accessed:
+        _files_accessed_json = json.dumps(sorted(_files_accessed))
+    else:
+        _files_accessed_json = "[]"
 
     # Check if execution exceeded time limit
     if _max_cpu_seconds > 0 and _elapsed > _max_cpu_seconds:
