@@ -179,28 +179,21 @@ impl CostStats {
     }
 
     /// Get a snapshot of current stats.
-    ///
-    /// Note: Uses Relaxed ordering for individual loads. The snapshot provides
-    /// a consistent view where total_tokens equals input_tokens + output_tokens.
     pub fn snapshot(&self) -> CostStatsSnapshot {
-        // Load all values once to ensure consistency within the snapshot
-        let input_tokens = self.input_tokens.load(Ordering::Relaxed);
-        let output_tokens = self.output_tokens.load(Ordering::Relaxed);
-        let cached_input_tokens = self.cached_input_tokens.load(Ordering::Relaxed);
-        let total_cost_micros = self.total_cost_micros.load(Ordering::Relaxed);
-        let cache_savings_micros = self.cache_savings_micros.load(Ordering::Relaxed);
-        let api_calls = self.api_calls.load(Ordering::Relaxed);
+        let total_cost = self.total_cost_micros.load(Ordering::Relaxed);
+        let cache_savings = self.cache_savings_micros.load(Ordering::Relaxed);
 
         CostStatsSnapshot {
-            input_tokens,
-            output_tokens,
-            cached_input_tokens,
-            total_tokens: input_tokens + output_tokens,
-            total_cost_micros,
-            total_cost_dollars: total_cost_micros as f64 / 1_000_000.0,
-            cache_savings_micros,
-            cache_savings_dollars: cache_savings_micros as f64 / 1_000_000.0,
-            api_calls,
+            input_tokens: self.input_tokens.load(Ordering::Relaxed),
+            output_tokens: self.output_tokens.load(Ordering::Relaxed),
+            cached_input_tokens: self.cached_input_tokens.load(Ordering::Relaxed),
+            total_tokens: self.input_tokens.load(Ordering::Relaxed)
+                + self.output_tokens.load(Ordering::Relaxed),
+            total_cost_micros: total_cost,
+            total_cost_dollars: total_cost as f64 / 1_000_000.0,
+            cache_savings_micros: cache_savings,
+            cache_savings_dollars: cache_savings as f64 / 1_000_000.0,
+            api_calls: self.api_calls.load(Ordering::Relaxed),
         }
     }
 }

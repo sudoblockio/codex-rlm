@@ -146,16 +146,21 @@ impl Bm25Index {
         results
             .into_iter()
             .filter_map(|r| {
-                let chunk_idx = r.document.id as usize;
-                self.chunks.get(chunk_idx).map(|c| {
-                    // Extract text from content using offsets
-                    let text = content.get(c.start..c.end).unwrap_or("").to_string();
-                    SearchResult {
-                        chunk: c.clone(),
-                        text,
-                        score: r.score,
-                    }
-                })
+                self.chunks
+                    .iter()
+                    .find(|c| c.id == r.document.id)
+                    .map(|c| {
+                        // Extract text from content using offsets
+                        let text = content
+                            .get(c.start..c.end)
+                            .unwrap_or("")
+                            .to_string();
+                        SearchResult {
+                            chunk: c.clone(),
+                            text,
+                            score: r.score,
+                        }
+                    })
             })
             .collect()
     }
@@ -365,20 +370,22 @@ impl DocTreeIndex {
         results
             .into_iter()
             .filter_map(|r| {
-                let chunk_idx = r.document.id as usize;
-                self.chunks.get(chunk_idx).map(|c| {
-                    // Extract text from document using offsets
-                    let text = store
-                        .document_content(&c.doc_id)
-                        .and_then(|content| content.get(c.start..c.end))
-                        .unwrap_or("")
-                        .to_string();
-                    DocSearchResult {
-                        chunk: c.clone(),
-                        text,
-                        score: r.score,
-                    }
-                })
+                self.chunks
+                    .iter()
+                    .find(|c| c.id == r.document.id)
+                    .map(|c| {
+                        // Extract text from document using offsets
+                        let text = store
+                            .document_content(&c.doc_id)
+                            .and_then(|content| content.get(c.start..c.end))
+                            .unwrap_or("")
+                            .to_string();
+                        DocSearchResult {
+                            chunk: c.clone(),
+                            text,
+                            score: r.score,
+                        }
+                    })
             })
             .collect()
     }

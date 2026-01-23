@@ -127,9 +127,7 @@ impl ToolHandler for RlmMemoryHandler {
                 let value = error_value(
                     "unsupported_tool",
                     format!("unsupported rlm memory tool: {tool_name}"),
-                    Some(
-                        "Use rlm_memory_put, rlm_memory_get, rlm_memory_list, rlm_memory_clear, or rlm_memory_batch",
-                    ),
+                    Some("Use rlm_memory_put, rlm_memory_get, rlm_memory_list, rlm_memory_clear, or rlm_memory_batch"),
                 );
                 Ok(json_tool_output(value, false))
             }

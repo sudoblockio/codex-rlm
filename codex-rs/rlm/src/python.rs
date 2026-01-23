@@ -22,7 +22,9 @@ pub enum BatchCallResult {
     /// Successful response string.
     Success(String),
     /// Error object with code, message, and retriable flag.
-    Error { error: BatchCallError },
+    Error {
+        error: BatchCallError,
+    },
 }
 
 /// Error details for a failed batch call.
@@ -92,12 +94,7 @@ impl LlmHandler {
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
-    fn batch(
-        &self,
-        py: Python<'_>,
-        prompts: Vec<String>,
-        max_concurrent: usize,
-    ) -> PyResult<String> {
+    fn batch(&self, py: Python<'_>, prompts: Vec<String>, max_concurrent: usize) -> PyResult<String> {
         py.detach(|| {
             let results = self.callback.batch(prompts, max_concurrent)?;
             serde_json::to_string(&results).map_err(anyhow::Error::from)
@@ -320,10 +317,7 @@ impl PythonRuntime {
         })
     }
 
-    pub fn set_search_callback(
-        &mut self,
-        callback: std::sync::Arc<dyn SearchCallback>,
-    ) -> Result<()> {
+    pub fn set_search_callback(&mut self, callback: std::sync::Arc<dyn SearchCallback>) -> Result<()> {
         self.search_callback = Some(callback.clone());
         Python::attach(|py| {
             let locals = self.locals.bind(py);
@@ -501,20 +495,75 @@ def _parse_flags(flags):
 
 
 def peek(start, end):
+    """Peek at context using global byte offsets.
+
+    Note: Returns a copy (Python string slice semantics).
+    """
     return P[start:end]
 
 
+def peek_doc(doc_id, start=0, end=None):
+    """Peek within a specific document's bounds.
+
+    This prevents offset confusion when working with appended contexts.
+    Offsets are relative to the document, not the global context.
+
+    Args:
+        doc_id: Document ID (relative path) from list_docs()
+        start: Start offset within the document (default 0)
+        end: End offset within the document (default: document size)
+
+    Returns:
+        str: The requested slice, or empty string if doc not found
+
+    Note: Returns a copy (Python string slice semantics).
+    """
+    data = _state.get("document_list_json")
+    if not data:
+        return ""
+
+    docs = json.loads(data)
+    doc = next((d for d in docs if d.get("id") == doc_id), None)
+    if not doc:
+        return ""
+
+    doc_start = doc.get("start", 0)
+    doc_size = doc.get("size", 0)
+
+    # Clamp offsets to document bounds
+    rel_start = max(0, min(start, doc_size))
+    rel_end = doc_size if end is None else max(rel_start, min(end, doc_size))
+
+    # Convert to global offsets
+    global_start = doc_start + rel_start
+    global_end = doc_start + rel_end
+
+    return P[global_start:global_end]
+
+
 def find(pattern, flags=None):
+    """Find all matches of pattern in context.
+
+    Args:
+        pattern: Regex pattern (uses Rust regex engine - linear time, no ReDoS).
+        flags: Optional regex flags string ('i' for case-insensitive, etc.)
+
+    Returns:
+        dict with keys:
+            matches: list of (start, end) tuples
+            capped: bool, True if results were truncated at limit
+    """
     compiled = re.compile(pattern, _parse_flags(flags))
     limit = _state.get("max_find_results", 0) or 0
-    results = []
+    matches = []
+    capped = False
     for match in compiled.finditer(P):
-        results.append((match.start(), match.end()))
-        if limit > 0 and len(results) >= limit:
+        matches.append((match.start(), match.end()))
+        if limit > 0 and len(matches) >= limit:
+            capped = True
             _state["find_results_capped"] = True
-            results.append((-1, -1))
             break
-    return results
+    return {"matches": matches, "capped": capped}
 
 
 def stats():
@@ -646,22 +695,31 @@ def llm_query(prompt, tools=None):
 
 
 def llm_query_batch(prompts, max_concurrent=5):
-    """Execute multiple prompts in parallel with concurrency limit.
+    """Execute multiple prompts with optional concurrency.
 
     Args:
         prompts: List of prompt strings
         max_concurrent: Maximum concurrent calls (default 5)
 
     Returns:
-        List of results, each either a response string or an error dict:
-        {"error": {"code": "...", "message": "...", "retriable": bool}}
+        dict with keys:
+            results: List of results, each either a response string or an error dict:
+                     {"error": {"code": "...", "message": "...", "retriable": bool}}
+            execution_mode: "sequential" or "parallel" (currently always "sequential")
+
+    Note: Currently executes sequentially; concurrency is a future optimization.
+    Ordering is preserved regardless of execution mode.
     """
     handler = _state.get("llm_handler")
     if handler is None:
         raise RuntimeError("llm_query_batch is not configured")
     results_json = handler.batch(prompts, max_concurrent)
     _state["budget_json"] = handler.budget_snapshot_json()
-    return json.loads(results_json)
+    results = json.loads(results_json)
+    return {
+        "results": results,
+        "execution_mode": "sequential",  # Currently sequential; parallel is future work
+    }
 
 
 def search(query, k=10):

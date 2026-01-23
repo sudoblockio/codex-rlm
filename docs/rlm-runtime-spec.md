@@ -1,6 +1,6 @@
 # RLM: Recursive Language Model Runtime
 
-**Status:** Draft v0.7
+**Status:** Draft v0.8
 **Vision:** Give agents the ability to process contexts of any size
 **Based on:** [Recursive Language Models](https://arxiv.org/abs/2512.24601) (arXiv:2512.24601)
 
@@ -26,12 +26,13 @@ TOOLS
 BUILTINS (available in rlm_exec)
   P                           The loaded context string
   peek(start, end)            View slice of P
-  find(pattern, flags?)       Regex search → [(start,end),...]
+  find(pattern, flags?)       Regex search → {"matches": [...], "capped": bool}
   search(query, k=10)         BM25 search → [{"text","score","start","end"},...]
   llm_query(prompt, tools?)   Spawn sub-agent → response string
-  llm_query_batch(prompts)    Parallel sub-agents → [response,...]
+  llm_query_batch(prompts)    Sub-agents → {"results": [...], "execution_mode": "..."}
+  peek_doc(doc_id,start,end)  View slice within specific document
   session()                   Full session manifest (sources, helpers, memory keys, budget)
-  stats()                     Context info → {"chars","tokens","lines","docs","sources"}
+  stats()                     Context info → {"chars","tokens","lines","docs","sources","context_hash"}
   limits()                    Current execution limits
   budget()                    Remaining budget → {"tokens","sub_calls","time_ms"}
   find_routes(topic)          Search AGENTS.md routing
@@ -191,7 +192,8 @@ Loads a large context into the Python environment. **Resets session state.**
     "document_count": 1725,
     "has_routing": true,
     "routing_entry_count": 362,
-    "sources": ["/path/to/loaded/dir"]
+    "sources": ["/path/to/loaded/dir"],
+    "context_hash": "a3f2e1b4c5d6789..."
   }
 }
 ```
@@ -306,6 +308,13 @@ Runs Python code with access to loaded context and builtins.
 }
 ```
 
+**stdout/stderr are always present:**
+- Both fields appear in success and error responses
+- On success: captures any `print()` output
+- On error: captures partial output before failure
+- Empty string `""` if nothing was printed
+```
+
 **Return channels:**
 
 | Variable | Field | Description |
@@ -409,7 +418,18 @@ All builtins are implemented in Rust and injected into Python.
 |---------|-----------|-------------|
 | `P` | `str` | The loaded context string. Read-only. |
 | `peek` | `peek(start, end) → str` | View slice `P[start:end]`. Bounds clamped. |
-| `find` | `find(pattern, flags?) → list[tuple]` | Regex search. Returns `[(start, end), ...]`. Max 10k results; if capped, last element is `(-1, -1)`. |
+| `peek_doc` | `peek_doc(doc_id, start?, end?) → str` | View slice within a specific document by ID. |
+| `find` | `find(pattern, flags?) → dict` | Regex search. Returns `{"matches": [(start, end), ...], "capped": bool}`. Max 10k results. |
+
+**`find` behavior:**
+- Returns `{"matches": [...], "capped": bool}` instead of a raw list
+- `capped: true` indicates results were truncated at the limit (default 10k)
+- Uses Rust's `regex` crate under the hood (linear-time, no catastrophic backtracking/ReDoS)
+
+**`peek_doc` behavior:**
+- `doc_id`: The document ID (relative path) from `list_docs()`
+- `start`, `end`: Offsets within the document (not global offsets)
+- Returns empty string if document not found
 
 **`find` flags:**
 - `"i"` — case insensitive
@@ -430,7 +450,7 @@ All builtins are implemented in Rust and injected into Python.
 | Builtin | Signature | Description |
 |---------|-----------|-------------|
 | `llm_query` | `llm_query(prompt, tools=None) → str` | Spawn sub-agent, block until done. Returns response string. |
-| `llm_query_batch` | `llm_query_batch(prompts, max_concurrent=5) → list` | Parallel sub-agents. Returns list of responses or error objects. |
+| `llm_query_batch` | `llm_query_batch(prompts, max_concurrent=5) → dict` | Batch sub-agents. Returns `{"results": [...], "execution_mode": "..."}`. |
 
 **`llm_query` behavior:**
 
@@ -450,13 +470,23 @@ response = llm_query("Fix this bug", tools=["shell", "write_file"])
 - If policy denies: raises `PolicyViolationError`
 - Override decisions are logged in `rlm_exec` response (see below)
 
-**`llm_query_batch` failure shape:**
-
-Successful calls return strings. Failed calls return structured error objects:
+**`llm_query_batch` return shape:**
 
 ```python
-results = llm_query_batch(["prompt1", "prompt2", "prompt3"])
-# results = ["response1", {"error": {"code": "timeout", "message": "...", "retriable": True}}, "response3"]
+response = llm_query_batch(["prompt1", "prompt2", "prompt3"])
+# response = {
+#   "results": ["response1", {"error": {...}}, "response3"],
+#   "execution_mode": "sequential"  # or "parallel" when available
+# }
+```
+
+- `results`: List of responses (strings) or error objects for each prompt
+- `execution_mode`: How the batch was executed (`"sequential"` or `"parallel"`)
+
+**Error objects in results:**
+
+```python
+{"error": {"code": "timeout", "message": "...", "retriable": True}}
 ```
 
 Error object fields:
@@ -480,6 +510,7 @@ Error object fields:
   "sources": ["/repo/docs", "/repo/src"],
   "context_chars": 4523891,
   "context_tokens_estimate": 1130972,
+  "context_hash": "a3f2e1b4c5d6...",  # SHA256 for determinism verification
   "helpers": ["analyze_chunk", "summarize_section"],
   "memory_keys": ["found_issues", "analysis_results"],
   "memory_bytes_used": 45231,
@@ -495,6 +526,13 @@ Error object fields:
   }
 }
 ```
+
+**`context_hash` for determinism:**
+
+The `context_hash` is a SHA256 hash of the loaded context string. Use it to:
+- Verify the same context is loaded for replay/debugging
+- Detect if context changed between runs
+- Cache results keyed by context hash
 
 This lets you re-orient after context switches without multiple tool calls.
 
@@ -718,14 +756,30 @@ This lets you understand why sub-agents had limited capabilities without guessin
 }
 ```
 
-### 7.2 Enforcement
+### 7.2 Budget Semantics
+
+**Token budget (`max_tokens`, `remaining_tokens`):**
+- Counts **input + output** tokens for all sub-agent calls
+- Estimated before execution, adjusted after
+- Includes system prompts and tool responses
+
+**Time budget (`max_time_ms`, `remaining_time_ms`):**
+- Wall-clock time across all operations
+- Includes Python execution, sub-agent calls, I/O
+- Does not pause during GIL release
+
+**Sub-call budget (`max_sub_calls`, `remaining_sub_calls`):**
+- Count of `llm_query` / `llm_query_batch` invocations
+- Each prompt in a batch counts as one sub-call
+
+### 7.3 Enforcement
 
 - `llm_query` checks budget before spawning
 - Token usage estimated per call
 - `BudgetExceededError` raised when exhausted
 - Budget visible via `budget()` builtin and `session()` manifest
 
-### 7.3 Recursion Prevention
+### 7.4 Recursion Prevention
 
 - Sub-agents cannot call RLM tools
 - Depth tracked; max depth = 1
@@ -786,14 +840,15 @@ This lets you understand why sub-agents had limited capabilities without guessin
 ### 10.1 Find and Analyze
 
 ```python
-matches = find(r"TODO|FIXME|HACK", "i")
-print(f"Found {len(matches)} items")
+find_result = find(r"TODO|FIXME|HACK", "i")
+matches = find_result["matches"]
+print(f"Found {len(matches)} items (capped: {find_result['capped']})")
 
 samples = [peek(max(0, s-30), e+100) for s, e in matches[:10]]
 analysis = llm_query(f"Categorize these by urgency:\n\n" + "\n---\n".join(samples))
 
 result = {"total_count": len(matches), "analyzed": len(samples), "analysis": analysis}
-result_meta = {"capped": len(matches) > 10}
+result_meta = {"capped": find_result["capped"]}
 ```
 
 ### 10.2 Budget-Aware Processing
@@ -804,14 +859,15 @@ print(f"Sources: {s['sources']}")
 print(f"Budget: {s['budget']['sub_calls']} calls remaining")
 print(f"Memory keys: {s['memory_keys']}")
 
-matches = find(r"function\s+\w+", "i")
+find_result = find(r"function\s+\w+", "i")
+matches = find_result["matches"]
 available_calls = s['budget']['sub_calls']
 
 if available_calls >= len(matches):
-    analyses = llm_query_batch([f"What does this do?\n{peek(s, e+500)}" for s, e in matches])
-    result = {"strategy": "full", "analyses": analyses}
+    batch_response = llm_query_batch([f"What does this do?\n{peek(start, end+500)}" for start, end in matches])
+    result = {"strategy": "full", "analyses": batch_response["results"], "execution_mode": batch_response["execution_mode"]}
 else:
-    sample = [peek(s, e+200) for s, e in matches[:5]]
+    sample = [peek(start, end+200) for start, end in matches[:5]]
     summary = llm_query(f"Summarize these functions:\n" + "\n---\n".join(sample))
     result = {"strategy": "sampled", "summary": summary}
 ```
@@ -820,9 +876,10 @@ else:
 
 ```python
 # Pass 1: Scan
-classes = find(r"class\s+(\w+)", "i")
+find_result = find(r"class\s+(\w+)", "i")
+classes = find_result["matches"]
 rlm_memory_put("classes", [{"start": s, "end": e} for s, e in classes[:50]])
-result = {"pass": 1, "found": len(classes)}
+result = {"pass": 1, "found": len(classes), "capped": find_result["capped"]}
 ```
 
 ```python
@@ -842,7 +899,8 @@ result = {"pass": 2, "analyzed": len(analyses)}
 
 ```python
 # When extracting lots of data, use result_meta for pagination info
-all_matches = find(r"error|exception|fail", "i")
+find_result = find(r"error|exception|fail", "i")
+all_matches = find_result["matches"]
 page_size = 100
 page = 0
 
@@ -853,7 +911,8 @@ result_meta = {
     "page": page,
     "page_size": page_size,
     "total_items": len(all_matches),
-    "has_more": len(all_matches) > (page+1) * page_size
+    "has_more": len(all_matches) > (page+1) * page_size,
+    "find_capped": find_result["capped"]
 }
 ```
 
@@ -893,18 +952,20 @@ See `codex-rs/rlm/INTEGRATION_PLAN.md` for detailed implementation phases and ch
 
 **Summary:**
 - ✅ PythonRuntime with PyO3
-- ✅ Core builtins (peek, find, stats, limits, llm_query)
+- ✅ Core builtins (peek, peek_doc, find, stats, limits, llm_query)
 - ⚠️ Context loading (file, directory, DocTree) — DocTree currently markdown-only
 - ✅ AGENTS.md routing
-- ✅ AST security validation
+- ✅ AST security validation (Rust regex for linear-time guarantee)
 - ✅ Structured output (result_json/result_meta/warnings/tool_override_events)
 - ✅ `rlm_load_append`
 - ✅ `rlm_query` convenience tool
-- ✅ `session()` manifest builtin
+- ✅ `session()` manifest builtin with `context_hash`
 - ✅ `limits()` builtin
 - ✅ Per-call limit overrides
 - ✅ Helpers with insertion-order injection
 - ✅ Memory with batch operations
 - ✅ Budget tracking integration (sub_calls/tokens/time decremented; tokens estimated from prompts)
 - ✅ Sub-agent tool override policy + audit logging
+- ✅ `find()` returns structured `{"matches": [...], "capped": bool}`
+- ✅ `llm_query_batch` returns `execution_mode` in response
 - ⚠️ `llm_query_batch` runs sequentially (no parallel fan-out yet)
