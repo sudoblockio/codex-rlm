@@ -2,6 +2,31 @@
 
 We provide Codex CLI as a standalone, native executable to ensure a zero-dependency install.
 
+## RLM Runtime (Large Context Processing)
+
+RLM (Recursive Language Model) is an embedded Python runtime that enables agents to efficiently process large codebases and documents. Instead of loading entire files into context, RLM provides tools for structured navigation and extraction.
+
+**Key Features:**
+- Load directories up to 100MB with automatic file filtering (binary, oversized, gitignored)
+- Python builtins: `peek_doc()`, `find()`, `search()`, `list_docs()`, `stats()`
+- Hierarchical routing via AGENTS.md files for codebase navigation
+- Sub-agent spawning with `llm_query()` for complex analysis
+- Coverage tracking and broken link detection for routing validation
+
+**Documentation:**
+- [RLM Runtime Spec](../docs/rlm-runtime-spec.md) — Full specification and tool reference
+- [RLM Installation Guide](./rlm/INSTALL.md) — Prerequisites and build instructions (requires Python 3.11+)
+
+**Quick Start:**
+```python
+# In rlm_exec after rlm_load("/path/to/codebase")
+docs = list_docs()                    # See available files
+content = peek_doc("src/main.rs")     # Read specific file
+matches = find(r"fn main")            # Regex search
+results = search("authentication", k=5)  # BM25 semantic search
+stats()                               # Check for broken_links
+```
+
 ## Installing Codex
 
 Today, the easiest way to install Codex is via `npm`:
