@@ -848,17 +848,14 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     if let Some(cwd) = subcommand_cli.cwd {
         interactive.cwd = Some(cwd);
     }
-    #[cfg(feature = "rlm")]
-    {
-        if subcommand_cli.rlm {
-            interactive.rlm = true;
-        }
-        if let Some(rlm_context) = subcommand_cli.rlm_context {
-            interactive.rlm_context = Some(rlm_context);
-        }
-        if let Some(rlm_text) = subcommand_cli.rlm_text {
-            interactive.rlm_text = Some(rlm_text);
-        }
+    if subcommand_cli.rlm {
+        interactive.rlm = true;
+    }
+    if let Some(rlm_context) = subcommand_cli.rlm_context {
+        interactive.rlm_context = Some(rlm_context);
+    }
+    if let Some(rlm_text) = subcommand_cli.rlm_text {
+        interactive.rlm_text = Some(rlm_text);
     }
     if subcommand_cli.web_search {
         interactive.web_search = true;

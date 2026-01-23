@@ -34,6 +34,30 @@ const PERSONALITY_PRAGMATIC: &str = include_str!("../../templates/personalities/
 
 pub(crate) const CONTEXT_WINDOW_272K: i64 = 272_000;
 
+/// Default RLM tools that should be available to all models.
+#[cfg(feature = "rlm")]
+pub(crate) fn default_rlm_tools() -> Vec<String> {
+    vec![
+        "rlm_load".to_string(),
+        "rlm_load_append".to_string(),
+        "rlm_exec".to_string(),
+        "rlm_query".to_string(),
+        "rlm_helpers_add".to_string(),
+        "rlm_helpers_list".to_string(),
+        "rlm_helpers_remove".to_string(),
+        "rlm_memory_put".to_string(),
+        "rlm_memory_get".to_string(),
+        "rlm_memory_list".to_string(),
+        "rlm_memory_clear".to_string(),
+        "rlm_memory_batch".to_string(),
+    ]
+}
+
+#[cfg(not(feature = "rlm"))]
+pub(crate) fn default_rlm_tools() -> Vec<String> {
+    Vec::new()
+}
+
 macro_rules! model_info {
     (
         $slug:expr $(, $key:ident : $value:expr )* $(,)?
@@ -64,7 +88,7 @@ macro_rules! model_info {
             context_window: Some(CONTEXT_WINDOW_272K),
             auto_compact_token_limit: None,
             effective_context_window_percent: 95,
-            experimental_supported_tools: Vec::new(),
+            experimental_supported_tools: default_rlm_tools(),
         };
 
         $(

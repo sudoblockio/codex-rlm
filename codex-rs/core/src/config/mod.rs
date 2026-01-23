@@ -111,6 +111,30 @@ Workflow: rlm_load → rlm_query (quick) or rlm_exec (complex) → iterate as ne
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 
+/// Default RLM tools to enable when the RLM feature is compiled in.
+#[cfg(feature = "rlm")]
+pub(crate) fn default_rlm_tools() -> Vec<String> {
+    vec![
+        "rlm_load".to_string(),
+        "rlm_load_append".to_string(),
+        "rlm_exec".to_string(),
+        "rlm_query".to_string(),
+        "rlm_helpers_add".to_string(),
+        "rlm_helpers_list".to_string(),
+        "rlm_helpers_remove".to_string(),
+        "rlm_memory_put".to_string(),
+        "rlm_memory_get".to_string(),
+        "rlm_memory_list".to_string(),
+        "rlm_memory_clear".to_string(),
+        "rlm_memory_batch".to_string(),
+    ]
+}
+
+#[cfg(not(feature = "rlm"))]
+pub(crate) fn default_rlm_tools() -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(test)]
 pub(crate) fn test_config() -> Config {
     let codex_home = tempdir().expect("create temp dir");
@@ -1485,7 +1509,7 @@ impl Config {
                 .any(|t| t.starts_with("rlm_"));
             if has_rlm_tools {
                 Some(match base {
-                    Some(existing) => format!("{}\n{}", existing, RLM_TOOL_INSTRUCTIONS),
+                    Some(existing) => format!("{existing}\n{RLM_TOOL_INSTRUCTIONS}"),
                     None => RLM_TOOL_INSTRUCTIONS.to_string(),
                 })
             } else {
@@ -1603,7 +1627,11 @@ impl Config {
             forced_login_method,
             include_apply_patch_tool: include_apply_patch_tool_flag,
             web_search_mode,
-            experimental_supported_tools,
+            experimental_supported_tools: config_profile
+                .experimental_supported_tools
+                .clone()
+                .or(cfg.experimental_supported_tools.clone())
+                .unwrap_or_else(default_rlm_tools),
             tool_allowlist: None,
             use_experimental_unified_exec_tool,
             ghost_snapshot,
