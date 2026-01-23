@@ -114,40 +114,6 @@
         }
       ]
     },
-    "compact_prompt": {
-      "description": "Compact prompt used for history compaction.",
-      "type": "string"
-    },
-    "developer_instructions": {
-      "description": "Developer instructions inserted as a `developer` role message.",
-      "default": null,
-      "type": "string"
-    },
-    "disable_paste_burst": {
-      "description": "When true, disables burst-paste detection for typed input entirely. All characters are inserted as they are received, and no buffering or placeholder replacement will occur for fast keypress bursts.",
-      "type": "boolean"
-    },
-    "experimental_compact_prompt_file": {
-      "$ref": "#/definitions/AbsolutePathBuf"
-    },
-    "experimental_supported_tools": {
-      "description": "User-configured experimental tools (e.g., [\"rlm_load\", \"rlm_exec\"]).",
-      "default": null,
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "experimental_use_freeform_apply_patch": {
-      "type": "boolean"
-    },
-    "experimental_use_unified_exec_tool": {
-      "type": "boolean"
-    },
-    "features": {
-      "description": "Centralized feature flags (new). Prefer this over individual toggles.",
-      "default": null,
-      "type": "object",
     "ConfigProfile": {
       "additionalProperties": false,
       "description": "Collection of common configuration options that a user can define as a unit in `config.toml`.",
@@ -163,6 +129,14 @@
         },
         "experimental_compact_prompt_file": {
           "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "experimental_supported_tools": {
+          "default": null,
+          "description": "Additional tools to enable (e.g., [\"rlm_load\", \"rlm_exec\"]).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "experimental_use_freeform_apply_patch": {
           "type": "boolean"
@@ -532,64 +506,12 @@
           "type": "string"
         },
         {
-          "$ref": "#/definitions/OtelConfigToml"
-        }
-      ]
-    },
-    "profile": {
-      "description": "Profile to use from the `profiles` map.",
-      "type": "string"
-    },
-    "profiles": {
-      "description": "Named profiles to facilitate switching between different configurations.",
-      "default": {},
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/ConfigProfile"
-      }
-    },
-    "project_doc_fallback_filenames": {
-      "description": "Ordered list of fallback filenames to look for when AGENTS.md is missing.",
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "project_doc_max_bytes": {
-      "description": "Maximum number of bytes to include from an AGENTS.md project doc file.",
-      "type": "integer",
-      "format": "uint",
-      "minimum": 0.0
-    },
-    "project_root_markers": {
-      "description": "Markers used to detect the project root when searching parent directories for `.codex` folders. Defaults to [\".git\"] when unset.",
-      "default": null,
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "projects": {
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/ProjectConfig"
-      }
-    },
-    "review_model": {
-      "description": "Review model override used by the `/review` feature.",
-      "type": "string"
-    },
-    "rlm": {
-      "description": "RLM runtime settings.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/RlmConfigToml"
-        }
-      ]
-    },
-    "sandbox_mode": {
-      "description": "Sandbox mode to use.",
-      "allOf": [
+          "description": "CODEX_HOME/.credentials.json This file will be readable to Codex and other applications running as the same user.",
+          "enum": [
+            "file"
+          ],
+          "type": "string"
+        },
         {
           "description": "Keyring when available, otherwise fail.",
           "enum": [
@@ -783,16 +705,8 @@
         "bearer_token_env_var": {
           "type": "string"
         },
-        "experimental_supported_tools": {
-          "description": "Additional tools to enable (e.g., [\"rlm_load\", \"rlm_exec\"]).",
-          "default": null,
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "experimental_use_freeform_apply_patch": {
-          "type": "boolean"
+        "command": {
+          "type": "string"
         },
         "cwd": {
           "default": null,
@@ -896,6 +810,89 @@
           "type": "string"
         }
       ]
+    },
+    "RlmConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "gateway": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RlmGatewayConfigToml"
+            }
+          ],
+          "description": "Optional gateway configuration for the RLM runtime."
+        },
+        "prompt": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RlmPromptConfigToml"
+            }
+          ],
+          "description": "Optional prompt template overrides for the RLM runtime."
+        },
+        "sub_agent_policy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RlmSubAgentPolicyToml"
+            }
+          ],
+          "description": "Optional sub-agent policy overrides for RLM tool calls."
+        }
+      },
+      "type": "object"
+    },
+    "RlmGatewayConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "api_key": {
+          "type": "string"
+        },
+        "api_key_env": {
+          "type": "string"
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "max_output_tokens": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "wire_api": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RlmPromptConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "template": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RlmSubAgentPolicyToml": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_tool_overrides": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "require_approval": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
     },
     "SandboxMode": {
       "enum": [
@@ -1209,6 +1206,14 @@
     "experimental_compact_prompt_file": {
       "$ref": "#/definitions/AbsolutePathBuf"
     },
+    "experimental_supported_tools": {
+      "default": null,
+      "description": "User-configured experimental tools (e.g., [\"rlm_load\", \"rlm_exec\"]).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "experimental_use_freeform_apply_patch": {
       "type": "boolean"
     },
@@ -1277,111 +1282,7 @@
         "shell_tool": {
           "type": "boolean"
         },
-        {
-          "description": "Option to disable reasoning summaries.",
-          "type": "string",
-          "enum": [
-            "none"
-          ]
-        }
-      ]
-    },
-    "RlmConfigToml": {
-      "type": "object",
-      "properties": {
-        "gateway": {
-          "description": "Optional gateway configuration for the RLM runtime.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/RlmGatewayConfigToml"
-            }
-          ]
-        },
-        "prompt": {
-          "description": "Optional prompt template overrides for the RLM runtime.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/RlmPromptConfigToml"
-            }
-          ]
-        },
-        "sub_agent_policy": {
-          "description": "Optional sub-agent policy overrides for RLM tool calls.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/RlmSubAgentPolicyToml"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "RlmGatewayConfigToml": {
-      "type": "object",
-      "properties": {
-        "api_key": {
-          "type": "string"
-        },
-        "api_key_env": {
-          "type": "string"
-        },
-        "base_url": {
-          "type": "string"
-        },
-        "max_output_tokens": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "model": {
-          "type": "string"
-        },
-        "provider": {
-          "type": "string"
-        },
-        "wire_api": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false
-    },
-    "RlmPromptConfigToml": {
-      "type": "object",
-      "properties": {
-        "template": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false
-    },
-    "RlmSubAgentPolicyToml": {
-      "type": "object",
-      "properties": {
-        "allowed_tool_overrides": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "require_approval": {
-          "type": "boolean"
-        }
-      },
-      "additionalProperties": false
-    },
-    "SandboxMode": {
-      "type": "string",
-      "enum": [
-        "read-only",
-        "workspace-write",
-        "danger-full-access"
-      ]
-    },
-    "SandboxWorkspaceWrite": {
-      "type": "object",
-      "properties": {
-        "exclude_slash_tmp": {
-          "default": false,
+        "steer": {
           "type": "boolean"
         },
         "undo": {
@@ -1611,6 +1512,14 @@
     "review_model": {
       "description": "Review model override used by the `/review` feature.",
       "type": "string"
+    },
+    "rlm": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RlmConfigToml"
+        }
+      ],
+      "description": "RLM runtime settings."
     },
     "sandbox_mode": {
       "allOf": [
