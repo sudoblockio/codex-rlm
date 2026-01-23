@@ -119,7 +119,8 @@ impl Bm25Index {
 
         // Extract content for each chunk and upsert into engine
         for chunk in &chunk_offsets {
-            let chunk_text = &content[chunk.start..chunk.end];
+            // Use get for safety in case of any boundary issues
+            let chunk_text = content.get(chunk.start..chunk.end).unwrap_or("");
             engine.upsert(Document {
                 id: chunk.id,
                 contents: chunk_text.to_string(),
@@ -182,13 +183,12 @@ fn chunk_content_offsets(content: &str, chunk_size: usize, overlap: usize) -> Ve
     }
 
     let mut chunks = Vec::new();
-    let bytes = content.as_bytes();
-    let len = bytes.len();
+    let len = content.len();
     let mut id = 0u32;
     let mut start = 0;
 
     while start < len {
-        // Find end position, trying to break at word boundary
+        // Find end position, trying to break at word boundary (returns valid char boundary)
         let raw_end = (start + chunk_size).min(len);
         let end = find_word_boundary(content, raw_end);
 
@@ -203,27 +203,57 @@ fn chunk_content_offsets(content: &str, chunk_size: usize, overlap: usize) -> Ve
         } else {
             chunk_size
         };
-        start += step;
+        // Ensure start is at a valid char boundary
+        start = ceil_char_boundary(content, start + step);
 
         // Ensure we make progress
         if start >= end && end < len {
-            start = end;
+            start = ceil_char_boundary(content, end);
         }
     }
 
     chunks
 }
 
-/// Find a word boundary near the given position.
+/// Find the nearest valid char boundary at or before the given byte position.
+fn floor_char_boundary(content: &str, pos: usize) -> usize {
+    if pos >= content.len() {
+        return content.len();
+    }
+    // Walk backwards to find a valid char boundary
+    let mut p = pos;
+    while p > 0 && !content.is_char_boundary(p) {
+        p -= 1;
+    }
+    p
+}
+
+/// Find the nearest valid char boundary at or after the given byte position.
+fn ceil_char_boundary(content: &str, pos: usize) -> usize {
+    if pos >= content.len() {
+        return content.len();
+    }
+    // Walk forwards to find a valid char boundary
+    let mut p = pos;
+    while p < content.len() && !content.is_char_boundary(p) {
+        p += 1;
+    }
+    p
+}
+
+/// Find a word boundary near the given position (returns a valid char boundary).
 fn find_word_boundary(content: &str, pos: usize) -> usize {
     if pos >= content.len() {
         return content.len();
     }
 
+    // Ensure we start at a valid char boundary
+    let pos = floor_char_boundary(content, pos);
+
     // Look backwards for whitespace
     let bytes = content.as_bytes();
     for i in (pos.saturating_sub(50)..=pos).rev() {
-        if i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        if i < bytes.len() && bytes[i].is_ascii_whitespace() && content.is_char_boundary(i + 1) {
             return i + 1;
         }
     }
@@ -231,13 +261,13 @@ fn find_word_boundary(content: &str, pos: usize) -> usize {
     // Look forwards for whitespace
     let end = (pos + 50).min(bytes.len());
     for (i, byte) in bytes.iter().enumerate().take(end).skip(pos) {
-        if byte.is_ascii_whitespace() {
+        if byte.is_ascii_whitespace() && content.is_char_boundary(i) {
             return i;
         }
     }
 
-    // Fall back to exact position
-    pos
+    // Fall back to nearest char boundary
+    floor_char_boundary(content, pos)
 }
 
 /// A chunk from a specific document (stores only offsets, not content).
@@ -298,8 +328,8 @@ impl DocTreeIndex {
                 let chunk_offsets =
                     chunk_content_offsets(content, config.chunk_size, config.chunk_overlap);
                 for chunk in chunk_offsets {
-                    // Extract content for the BM25 engine
-                    let chunk_text = &content[chunk.start..chunk.end];
+                    // Extract content for the BM25 engine (use get for safety)
+                    let chunk_text = content.get(chunk.start..chunk.end).unwrap_or("");
 
                     let doc_chunk = DocChunk {
                         id: global_id,
