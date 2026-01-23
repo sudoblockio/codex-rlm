@@ -157,12 +157,27 @@ fn build_exec_response(
     }
 
     if let Some(error) = outcome.result.error {
+        // Check if this is a policy violation error
+        let (error_code, suggestion) = if outcome.result.tool_override_denied
+            || error.contains("tool override denied")
+            || error.contains("PolicyViolationError")
+        {
+            (
+                "policy_violation",
+                "Remove tools parameter or request approval from policy",
+            )
+        } else {
+            (
+                "python_error",
+                "Check the traceback and fix the Python code",
+            )
+        };
         let value = json!({
             "success": false,
-            "error_code": "python_error",
+            "error_code": error_code,
             "error_message": error,
             "traceback": outcome.result.traceback,
-            "suggestion": "Check the traceback and fix the Python code",
+            "suggestion": suggestion,
             "stdout": outcome.result.output,
             "stderr": "",
             "warnings": warnings,
@@ -301,6 +316,28 @@ mod tests {
         };
         let value: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(value["error_code"], "python_error");
+    }
+
+    #[test]
+    fn exec_response_policy_violation_returns_correct_error_code() {
+        let mut result = base_result();
+        result.error = Some("tool override denied".to_string());
+        result.tool_override_denied = true;
+        let outcome = RlmExecOutcome {
+            result,
+            limits_applied: RlmLimits::default(),
+            budget: BudgetSnapshot::new(1, 1, 1, 1),
+        };
+        let output = build_exec_response(outcome, 7);
+        let ToolOutput::Function { content, .. } = output else {
+            panic!("expected function output");
+        };
+        let value: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["error_code"], "policy_violation");
+        assert!(value["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains("request approval"));
     }
 
     #[test]

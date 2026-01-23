@@ -1750,6 +1750,7 @@ dependencies = [
  "bm25",
  "chrono",
  "codex-utils-cargo-bin",
+ "ignore",
  "memmap2",
  "pretty_assertions",
  "pyo3",

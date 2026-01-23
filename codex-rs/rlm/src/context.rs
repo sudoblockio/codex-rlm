@@ -4,8 +4,18 @@ use std::path::PathBuf;
 use anyhow::Result;
 use anyhow::bail;
 use async_trait::async_trait;
+use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde::Serialize;
+
+/// Maximum file size to load (10MB).
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Maximum total context size (100MB).
+const MAX_TOTAL_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Maximum number of files to load.
+const MAX_FILES: usize = 10_000;
 
 #[async_trait]
 pub trait ContextStore: Send + Sync {
@@ -45,8 +55,16 @@ pub struct ContextMetadata {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DocumentMetadata {
+    /// Document ID (relative path).
     pub id: String,
+    /// Relative path to the file (same as id).
+    pub path: String,
+    /// Size of the document content in bytes.
     pub size: usize,
+    /// Start offset in the combined content.
+    pub start: usize,
+    /// End offset in the combined content.
+    pub end: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -308,26 +326,52 @@ pub fn is_markdown_file(path: &Path) -> bool {
         .is_some_and(|ext| ext == "md")
 }
 
-/// Check if path should be skipped (node_modules, .git, etc.).
-fn should_skip_path(path: &Path) -> bool {
-    path.components().any(|c| {
-        let s = c.as_os_str().to_string_lossy();
-        s == "node_modules" || s == ".git" || s == "target" || s == "__pycache__"
-    })
+/// Check if a file appears to be a text file by sampling the first chunk.
+/// Returns false for binary files (containing null bytes) or non-UTF-8 files.
+fn is_text_file(path: &Path) -> bool {
+    // Check file size first
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    if metadata.len() > MAX_FILE_SIZE {
+        return false;
+    }
+
+    // Read the first 8KB to check for binary content
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    use std::io::Read;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buffer = [0u8; 8192];
+    let bytes_read = match reader.read(&mut buffer) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+
+    // Check for null bytes (binary indicator)
+    if buffer[..bytes_read].contains(&0) {
+        return false;
+    }
+
+    // Check if it's valid UTF-8
+    std::str::from_utf8(&buffer[..bytes_read]).is_ok()
 }
 
-/// A document in the doc tree.
+/// A document in the doc tree (content accessed via DocTreeStore).
 #[derive(Clone, Debug)]
 pub struct Document {
     /// Relative path from the root (used as ID).
     pub id: String,
     /// Absolute path to the file.
     pub path: PathBuf,
-    /// Content of the document.
-    pub content: String,
-    /// Byte offset in the combined content.
-    pub offset: usize,
-    /// Size in bytes.
+    /// Byte offset to the start of the actual content in combined content (after separator).
+    pub content_offset: usize,
+    /// Size of the content in bytes.
     pub size: usize,
     /// Whether this is an AGENTS.md file (routing file).
     pub is_agents_md: bool,
@@ -364,6 +408,15 @@ impl DocTreeStore {
         self.documents.get(id)
     }
 
+    /// Get the content of a document by ID.
+    ///
+    /// This extracts the content from the combined_content using offsets.
+    pub fn document_content(&self, id: &str) -> Option<&str> {
+        let doc = self.documents.get(id)?;
+        self.combined_content
+            .get(doc.content_offset..doc.content_offset + doc.size)
+    }
+
     /// List all document IDs.
     pub fn list_documents(&self) -> Vec<&str> {
         self.documents
@@ -393,7 +446,44 @@ impl DocTreeStore {
         self.agents_files.clear();
 
         let mut docs = Vec::new();
-        Self::walk_dir(&root, &root, &mut docs)?;
+        let mut total_size: u64 = 0;
+
+        // Use ignore crate for gitignore-aware walking
+        let walker = WalkBuilder::new(&root)
+            .hidden(false) // Don't skip hidden files by default
+            .git_ignore(true) // Respect .gitignore
+            .git_global(true) // Respect global gitignore
+            .git_exclude(true) // Respect .git/info/exclude
+            .build();
+
+        for entry in walker.flatten() {
+            let path = entry.path();
+
+            // Skip directories
+            if path.is_dir() {
+                continue;
+            }
+
+            // Check file count limit
+            if docs.len() >= MAX_FILES {
+                tracing::warn!(
+                    "Reached maximum file count ({MAX_FILES}), skipping remaining files"
+                );
+                break;
+            }
+
+            // Check if it's a text file (also checks file size limit internally)
+            if !is_text_file(path) {
+                continue;
+            }
+
+            let rel_path = path
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+            docs.push((rel_path, path.to_path_buf()));
+        }
 
         // Sort for deterministic order
         docs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -411,33 +501,46 @@ impl DocTreeStore {
                 }
             };
 
+            // Check total size limit
+            let content_size = content.len() as u64;
+            if total_size + content_size > MAX_TOTAL_SIZE {
+                tracing::warn!(
+                    "Reached maximum total size ({MAX_TOTAL_SIZE} bytes), skipping remaining files"
+                );
+                break;
+            }
+            total_size += content_size;
+
             let is_agents_md = rel_path.ends_with("AGENTS.md");
             if is_agents_md {
                 self.agents_files.push(rel_path.clone());
             }
 
-            let offset = combined.len();
             let size = content.len();
 
-            // Add separator and content
+            // Add separator and content per spec: \n===== {relative_path} =====\n
             if !combined.is_empty() {
-                combined.push_str("\n\n");
+                combined.push('\n');
             }
-            combined.push_str(&format!("=== {rel_path} ===\n"));
+            let separator = format!("===== {rel_path} =====\n");
+            combined.push_str(&separator);
+            let content_offset = combined.len(); // After separator
             combined.push_str(&content);
 
             let doc = Document {
                 id: rel_path.clone(),
                 path: abs_path,
-                content: content.clone(),
-                offset,
+                content_offset,
                 size,
                 is_agents_md,
             };
 
             doc_metadata.push(DocumentMetadata {
                 id: rel_path.clone(),
+                path: rel_path.clone(), // Use relative path per spec
                 size,
+                start: content_offset,
+                end: content_offset + size,
             });
 
             self.documents.insert(rel_path, doc);
@@ -459,37 +562,6 @@ impl DocTreeStore {
             },
             documents: doc_metadata,
         };
-
-        Ok(())
-    }
-
-    /// Recursively walk a directory to find markdown files.
-    fn walk_dir(root: &Path, current: &Path, docs: &mut Vec<(String, PathBuf)>) -> Result<()> {
-        if should_skip_path(current) {
-            return Ok(());
-        }
-
-        let entries = match std::fs::read_dir(current) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("Failed to read directory {}: {}", current.display(), e);
-                return Ok(());
-            }
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-
-            if path.is_dir() {
-                Self::walk_dir(root, &path, docs)?;
-            } else if is_markdown_file(&path) {
-                let rel_path = path
-                    .strip_prefix(root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| path.to_string_lossy().to_string());
-                docs.push((rel_path, path));
-            }
-        }
 
         Ok(())
     }
@@ -525,11 +597,14 @@ impl ContextStore for DocTreeStore {
             .get(doc_id)
             .ok_or_else(|| anyhow::anyhow!("document not found: {doc_id}"))?;
 
-        if start > end || end > doc.content.len() {
+        if start > end || end > doc.size {
             bail!("invalid span {start}-{end} for doc {doc_id}");
         }
 
-        Ok(&doc.content[start..end])
+        // Calculate absolute offset in combined_content
+        let abs_start = doc.content_offset + start;
+        let abs_end = doc.content_offset + end;
+        Ok(&self.combined_content[abs_start..abs_end])
     }
 
     fn metadata(&self) -> &ContextMetadata {
@@ -560,11 +635,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // Create a simple doc tree
+        // Create a simple doc tree with various text files
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "# Root\n- [docs](docs/AGENTS.md)").unwrap();
         std::fs::write(root.join("docs/AGENTS.md"), "# Docs\n- [readme](readme.md)").unwrap();
         std::fs::write(root.join("docs/readme.md"), "# Readme\nHello world").unwrap();
+        std::fs::write(root.join("docs/code.rs"), "fn main() {}").unwrap();
 
         let mut store = DocTreeStore::new();
         store
@@ -572,7 +648,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.metadata().size.documents, 3);
+        // Should load all text files (md and rs)
+        assert_eq!(store.metadata().size.documents, 4);
         assert_eq!(store.list_agents_files().len(), 2);
 
         // Can fetch individual doc
@@ -581,14 +658,18 @@ mod tests {
 
         // Can list docs under path
         let docs = store.list_documents_under("docs/");
-        assert_eq!(docs.len(), 2);
+        assert_eq!(docs.len(), 3);
     }
 
     #[tokio::test]
-    async fn doc_tree_skips_node_modules() {
+    async fn doc_tree_respects_gitignore() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
+        // Initialize as a git repository (required for .gitignore to be respected)
+        std::fs::create_dir(root.join(".git")).unwrap();
+        // Create .gitignore to ignore node_modules
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
         std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "# Root").unwrap();
         std::fs::write(root.join("node_modules/pkg/readme.md"), "# Skip me").unwrap();
@@ -599,7 +680,62 @@ mod tests {
             .await
             .unwrap();
 
-        // Should only have root AGENTS.md, not the node_modules file
-        assert_eq!(store.metadata().size.documents, 1);
+        // Should only have AGENTS.md and .gitignore (text files), not node_modules
+        // Note: .gitignore itself is also a text file
+        let doc_ids: Vec<_> = store.list_documents();
+        assert!(
+            !doc_ids.contains(&"node_modules/pkg/readme.md"),
+            "should not include gitignored files"
+        );
+        assert!(doc_ids.contains(&"AGENTS.md"));
+    }
+
+    #[tokio::test]
+    async fn doc_tree_skips_binary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("readme.md"), "# Hello").unwrap();
+        // Create a binary file (containing null bytes)
+        std::fs::write(root.join("binary.bin"), b"\x00\x01\x02\x03").unwrap();
+
+        let mut store = DocTreeStore::new();
+        store
+            .load(ContextSource::DocTree(root.to_path_buf()))
+            .await
+            .unwrap();
+
+        let doc_ids: Vec<_> = store.list_documents();
+        assert!(doc_ids.contains(&"readme.md"));
+        assert!(
+            !doc_ids.contains(&"binary.bin"),
+            "should not include binary files"
+        );
+    }
+
+    #[tokio::test]
+    async fn doc_tree_uses_spec_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.txt"), "content a").unwrap();
+        std::fs::write(root.join("b.txt"), "content b").unwrap();
+
+        let mut store = DocTreeStore::new();
+        store
+            .load(ContextSource::DocTree(root.to_path_buf()))
+            .await
+            .unwrap();
+
+        let content = store.content().unwrap();
+        // Spec requires: \n===== {relative_path} =====\n
+        assert!(
+            content.contains("===== a.txt ====="),
+            "should use 5-equals separator"
+        );
+        assert!(
+            content.contains("===== b.txt ====="),
+            "should use 5-equals separator"
+        );
     }
 }

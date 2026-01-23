@@ -44,7 +44,7 @@ impl Default for IndexConfig {
     }
 }
 
-/// A chunk of indexed content.
+/// A chunk of indexed content (stores only offsets, not content).
 #[derive(Clone, Debug)]
 pub struct Chunk {
     /// Unique chunk ID.
@@ -53,15 +53,15 @@ pub struct Chunk {
     pub start: usize,
     /// End offset in the original content (bytes).
     pub end: usize,
-    /// The chunk content.
-    pub content: String,
 }
 
 /// Search result from BM25 query.
 #[derive(Clone, Debug)]
 pub struct SearchResult {
-    /// The matching chunk.
+    /// The matching chunk (offsets only).
     pub chunk: Chunk,
+    /// The extracted text content.
+    pub text: String,
     /// BM25 relevance score.
     pub score: f32,
 }
@@ -82,7 +82,7 @@ pub struct SearchResultJson {
 impl From<SearchResult> for SearchResultJson {
     fn from(result: SearchResult) -> Self {
         Self {
-            text: result.chunk.content,
+            text: result.text,
             score: result.score,
             start: result.chunk.start,
             end: result.chunk.end,
@@ -96,8 +96,6 @@ pub struct Bm25Index {
     engine: SearchEngine<u32>,
     /// Stored chunks for retrieval.
     chunks: Vec<Chunk>,
-    /// Configuration.
-    config: IndexConfig,
 }
 
 impl Bm25Index {
@@ -108,34 +106,37 @@ impl Bm25Index {
         Self {
             engine: SearchEngineBuilder::with_avgdl(avgdl).build(),
             chunks: Vec::new(),
-            config,
         }
     }
 
     /// Build an index from content.
     pub fn from_content(content: &str, config: IndexConfig) -> Self {
-        let chunks = chunk_content(content, config.chunk_size, config.chunk_overlap);
+        let chunk_offsets = chunk_content_offsets(content, config.chunk_size, config.chunk_overlap);
 
         // Build engine with estimated avgdl, then upsert documents
         let avgdl = config.chunk_size as f32;
         let mut engine: SearchEngine<u32> = SearchEngineBuilder::with_avgdl(avgdl).build();
 
-        for chunk in &chunks {
+        // Extract content for each chunk and upsert into engine
+        for chunk in &chunk_offsets {
+            let chunk_text = &content[chunk.start..chunk.end];
             engine.upsert(Document {
                 id: chunk.id,
-                contents: chunk.content.clone(),
+                contents: chunk_text.to_string(),
             });
         }
 
         Self {
             engine,
-            chunks,
-            config,
+            chunks: chunk_offsets,
         }
     }
 
     /// Search the index for matching chunks.
-    pub fn search(&self, query: &str, k: usize) -> Vec<SearchResult> {
+    ///
+    /// The `content` parameter must be the same content used to build the index,
+    /// as chunk offsets are used to extract text.
+    pub fn search(&self, query: &str, k: usize, content: &str) -> Vec<SearchResult> {
         if self.chunks.is_empty() {
             return Vec::new();
         }
@@ -147,9 +148,17 @@ impl Bm25Index {
                 self.chunks
                     .iter()
                     .find(|c| c.id == r.document.id)
-                    .map(|c| SearchResult {
-                        chunk: c.clone(),
-                        score: r.score,
+                    .map(|c| {
+                        // Extract text from content using offsets
+                        let text = content
+                            .get(c.start..c.end)
+                            .unwrap_or("")
+                            .to_string();
+                        SearchResult {
+                            chunk: c.clone(),
+                            text,
+                            score: r.score,
+                        }
                     })
             })
             .collect()
@@ -164,25 +173,10 @@ impl Bm25Index {
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
-
-    /// Get a chunk by ID.
-    pub fn get_chunk(&self, id: u32) -> Option<&Chunk> {
-        self.chunks.iter().find(|c| c.id == id)
-    }
-
-    /// Get all chunks.
-    pub fn chunks(&self) -> &[Chunk] {
-        &self.chunks
-    }
-
-    /// Get the index configuration.
-    pub fn config(&self) -> &IndexConfig {
-        &self.config
-    }
 }
 
-/// Split content into overlapping chunks.
-fn chunk_content(content: &str, chunk_size: usize, overlap: usize) -> Vec<Chunk> {
+/// Split content into overlapping chunks (offsets only, no content storage).
+fn chunk_content_offsets(content: &str, chunk_size: usize, overlap: usize) -> Vec<Chunk> {
     if content.is_empty() || chunk_size == 0 {
         return Vec::new();
     }
@@ -198,14 +192,8 @@ fn chunk_content(content: &str, chunk_size: usize, overlap: usize) -> Vec<Chunk>
         let raw_end = (start + chunk_size).min(len);
         let end = find_word_boundary(content, raw_end);
 
-        // Extract chunk
-        let chunk_str = &content[start..end];
-        chunks.push(Chunk {
-            id,
-            start,
-            end,
-            content: chunk_str.to_string(),
-        });
+        // Store only offsets, not content
+        chunks.push(Chunk { id, start, end });
 
         id += 1;
 
@@ -252,7 +240,7 @@ fn find_word_boundary(content: &str, pos: usize) -> usize {
     pos
 }
 
-/// A chunk from a specific document.
+/// A chunk from a specific document (stores only offsets, not content).
 #[derive(Clone, Debug)]
 pub struct DocChunk {
     /// Unique chunk ID.
@@ -263,15 +251,15 @@ pub struct DocChunk {
     pub start: usize,
     /// End offset in the document (bytes).
     pub end: usize,
-    /// The chunk content.
-    pub content: String,
 }
 
 /// Search result from document-aware BM25 query.
 #[derive(Clone, Debug)]
 pub struct DocSearchResult {
-    /// The matching chunk.
+    /// The matching chunk (offsets only).
     pub chunk: DocChunk,
+    /// The extracted text content.
+    pub text: String,
     /// BM25 relevance score.
     pub score: f32,
 }
@@ -282,8 +270,6 @@ pub struct DocTreeIndex {
     engine: SearchEngine<u32>,
     /// Stored chunks for retrieval.
     chunks: Vec<DocChunk>,
-    /// Configuration.
-    config: IndexConfig,
     /// Total documents indexed.
     doc_count: usize,
 }
@@ -295,7 +281,6 @@ impl DocTreeIndex {
         Self {
             engine: SearchEngineBuilder::with_avgdl(avgdl).build(),
             chunks: Vec::new(),
-            config,
             doc_count: 0,
         }
     }
@@ -309,20 +294,23 @@ impl DocTreeIndex {
 
         let mut global_id = 0u32;
         for doc_id in doc_ids {
-            if let Some(doc) = store.get_document(doc_id) {
-                let chunks = chunk_content(&doc.content, config.chunk_size, config.chunk_overlap);
-                for chunk in chunks {
+            if let Some(content) = store.document_content(doc_id) {
+                let chunk_offsets =
+                    chunk_content_offsets(content, config.chunk_size, config.chunk_overlap);
+                for chunk in chunk_offsets {
+                    // Extract content for the BM25 engine
+                    let chunk_text = &content[chunk.start..chunk.end];
+
                     let doc_chunk = DocChunk {
                         id: global_id,
                         doc_id: doc_id.to_string(),
                         start: chunk.start,
                         end: chunk.end,
-                        content: chunk.content.clone(),
                     };
 
                     index.engine.upsert(Document {
                         id: global_id,
-                        contents: chunk.content,
+                        contents: chunk_text.to_string(),
                     });
 
                     index.chunks.push(doc_chunk);
@@ -335,7 +323,15 @@ impl DocTreeIndex {
     }
 
     /// Search the index for matching chunks.
-    pub fn search(&self, query: &str, k: usize) -> Vec<DocSearchResult> {
+    ///
+    /// The `store` parameter must be the same DocTreeStore used to build the index,
+    /// as chunk offsets are used to extract text from documents.
+    pub fn search(
+        &self,
+        query: &str,
+        k: usize,
+        store: &crate::context::DocTreeStore,
+    ) -> Vec<DocSearchResult> {
         if self.chunks.is_empty() {
             return Vec::new();
         }
@@ -347,17 +343,33 @@ impl DocTreeIndex {
                 self.chunks
                     .iter()
                     .find(|c| c.id == r.document.id)
-                    .map(|c| DocSearchResult {
-                        chunk: c.clone(),
-                        score: r.score,
+                    .map(|c| {
+                        // Extract text from document using offsets
+                        let text = store
+                            .document_content(&c.doc_id)
+                            .and_then(|content| content.get(c.start..c.end))
+                            .unwrap_or("")
+                            .to_string();
+                        DocSearchResult {
+                            chunk: c.clone(),
+                            text,
+                            score: r.score,
+                        }
                     })
             })
             .collect()
     }
 
     /// Search and group results by document.
-    pub fn search_by_doc(&self, query: &str, k: usize) -> Vec<(String, Vec<DocSearchResult>)> {
-        let results = self.search(query, k * 3); // Get more results for grouping
+    ///
+    /// The `store` parameter must be the same DocTreeStore used to build the index.
+    pub fn search_by_doc(
+        &self,
+        query: &str,
+        k: usize,
+        store: &crate::context::DocTreeStore,
+    ) -> Vec<(String, Vec<DocSearchResult>)> {
+        let results = self.search(query, k * 3, store); // Get more results for grouping
 
         // Group by document
         let mut by_doc: std::collections::HashMap<String, Vec<DocSearchResult>> =
@@ -398,21 +410,6 @@ impl DocTreeIndex {
     pub fn doc_count(&self) -> usize {
         self.doc_count
     }
-
-    /// Get a chunk by ID.
-    pub fn get_chunk(&self, id: u32) -> Option<&DocChunk> {
-        self.chunks.iter().find(|c| c.id == id)
-    }
-
-    /// Get all chunks for a specific document.
-    pub fn chunks_for_doc(&self, doc_id: &str) -> Vec<&DocChunk> {
-        self.chunks.iter().filter(|c| c.doc_id == doc_id).collect()
-    }
-
-    /// Get the index configuration.
-    pub fn config(&self) -> &IndexConfig {
-        &self.config
-    }
 }
 
 #[cfg(test)]
@@ -422,7 +419,7 @@ mod tests {
     #[test]
     fn chunks_content_with_overlap() {
         let content = "word1 word2 word3 word4 word5 word6 word7 word8 word9 word10";
-        let chunks = chunk_content(content, 20, 5);
+        let chunks = chunk_content_offsets(content, 20, 5);
 
         assert!(!chunks.is_empty());
         // Verify chunks have IDs
@@ -433,16 +430,17 @@ mod tests {
 
     #[test]
     fn empty_content_produces_no_chunks() {
-        let chunks = chunk_content("", 100, 10);
+        let chunks = chunk_content_offsets("", 100, 10);
         assert!(chunks.is_empty());
     }
 
     #[test]
     fn small_content_produces_single_chunk() {
         let content = "hello world";
-        let chunks = chunk_content(content, 1000, 100);
+        let chunks = chunk_content_offsets(content, 1000, 100);
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].content, content);
+        // Extract content using offsets
+        assert_eq!(&content[chunks[0].start..chunks[0].end], content);
     }
 
     #[test]
@@ -459,17 +457,17 @@ mod tests {
 
         assert!(!index.is_empty());
 
-        let results = index.search("fox", 5);
+        let results = index.search("fox", 5, content);
         assert!(!results.is_empty());
         // At least one result should contain "fox"
-        assert!(results.iter().any(|r| r.chunk.content.contains("fox")));
+        assert!(results.iter().any(|r| r.text.contains("fox")));
     }
 
     #[test]
     fn search_empty_index_returns_empty() {
         let config = IndexConfig::default();
         let index = Bm25Index::new(config);
-        let results = index.search("anything", 10);
+        let results = index.search("anything", 10, "");
         assert!(results.is_empty());
     }
 
@@ -478,7 +476,7 @@ mod tests {
         let content = "hello world";
         let config = IndexConfig::default();
         let index = Bm25Index::from_content(content, config);
-        let results = index.search("xyznonexistent123", 10);
+        let results = index.search("xyznonexistent123", 10, content);
         assert!(results.is_empty());
     }
 
@@ -529,13 +527,13 @@ mod tests {
         assert!(!index.is_empty());
 
         // Search for authentication-related content
-        let results = index.search("authentication OAuth2", 5);
+        let results = index.search("authentication OAuth2", 5, &store);
         assert!(!results.is_empty());
         // Auth doc should be in results
         assert!(results.iter().any(|r| r.chunk.doc_id == "api/auth.md"));
 
         // Search by doc
-        let by_doc = index.search_by_doc("authentication", 3);
+        let by_doc = index.search_by_doc("authentication", 3, &store);
         assert!(!by_doc.is_empty());
         // First result should be auth doc (best match)
         assert!(by_doc.iter().any(|(doc_id, _)| doc_id == "api/auth.md"));

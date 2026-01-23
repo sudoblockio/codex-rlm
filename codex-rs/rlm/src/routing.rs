@@ -285,8 +285,8 @@ impl HierarchicalRoutingGraph {
 
         // First pass: create nodes for each AGENTS.md
         for path in agents_files {
-            if let Some(doc) = store.get_document(path) {
-                let entries = parse_manifest(&doc.content);
+            if let Some(content) = store.document_content(path) {
+                let entries = parse_manifest(content);
                 graph.total_entries += entries.len();
                 let node = RoutingNode {
                     path: path.clone(),

@@ -131,6 +131,12 @@ impl ToolCallRuntime {
             "shell" | "container.exec" | "local_shell" | "shell_command" | "unified_exec" => {
                 format!("Wall time: {secs:.1} seconds\naborted by user")
             }
+            name if name.starts_with("rlm_") => {
+                // Return structured JSON error for RLM tools
+                format!(
+                    r#"{{"success":false,"error_code":"cancelled","error_message":"operation cancelled by user after {secs:.1}s","suggestion":"Retry the operation if needed"}}"#
+                )
+            }
             _ => format!("aborted by user after {secs:.1}s"),
         }
     }

@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 bm25 = "2.3"
+ignore = "0.4"
 regex = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }

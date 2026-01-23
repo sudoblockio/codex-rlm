@@ -10,7 +10,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::rlm_types::json_tool_output;
-use crate::tools::handlers::rlm_types::validate_existing_absolute_path;
+use crate::tools::handlers::rlm_types::validate_path_in_sandbox;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 
@@ -32,7 +32,10 @@ impl ToolHandler for RlmLoadHandler {
         invocation: ToolInvocation,
     ) -> Result<crate::tools::context::ToolOutput, FunctionCallError> {
         let ToolInvocation {
-            payload, session, ..
+            payload,
+            session,
+            turn,
+            ..
         } = invocation;
 
         let arguments = match payload {
@@ -46,7 +49,9 @@ impl ToolHandler for RlmLoadHandler {
 
         let args: RlmLoadArgs = parse_arguments(&arguments)?;
         let path = PathBuf::from(&args.path);
-        if let Err(value) = validate_existing_absolute_path(&path) {
+
+        // Validate path is within sandbox boundaries
+        if let Err(value) = validate_path_in_sandbox(&path, &turn.sandbox_policy, &turn.cwd) {
             return Ok(json_tool_output(value, false));
         }
 

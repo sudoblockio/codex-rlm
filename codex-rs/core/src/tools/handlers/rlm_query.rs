@@ -186,9 +186,7 @@ fn bm25_sections(session: &mut RlmSession, prompt: &str, max_sections: usize) ->
     session
         .bm25_search(prompt, max_sections)
         .into_iter()
-        .map(|result| Section {
-            content: result.chunk.content,
-        })
+        .map(|result| Section { content: result.text })
         .collect()
 }
 

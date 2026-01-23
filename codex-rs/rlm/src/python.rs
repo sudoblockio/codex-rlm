@@ -12,6 +12,47 @@ use crate::policy::PolicySummary;
 use crate::routing::HierarchicalRoutingGraph;
 use crate::routing::RoutingGraph;
 
+/// Default max concurrent calls for llm_query_batch.
+pub const DEFAULT_MAX_CONCURRENT: usize = 5;
+
+/// Result of a single call in llm_query_batch.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum BatchCallResult {
+    /// Successful response string.
+    Success(String),
+    /// Error object with code, message, and retriable flag.
+    Error {
+        error: BatchCallError,
+    },
+}
+
+/// Error details for a failed batch call.
+#[derive(Clone, Debug, Serialize)]
+pub struct BatchCallError {
+    pub code: String,
+    pub message: String,
+    pub retriable: bool,
+}
+
+impl BatchCallResult {
+    /// Create a success result.
+    pub fn success(response: String) -> Self {
+        Self::Success(response)
+    }
+
+    /// Create an error result.
+    pub fn error(code: impl Into<String>, message: impl Into<String>, retriable: bool) -> Self {
+        Self::Error {
+            error: BatchCallError {
+                code: code.into(),
+                message: message.into(),
+                retriable,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExecutionResult {
     pub output: String,
@@ -29,7 +70,9 @@ pub struct ExecutionResult {
 
 pub trait LlmCallback: Send + Sync {
     fn call(&self, prompt: &str, tools: Option<Vec<String>>) -> Result<String>;
-    fn batch(&self, prompts: Vec<String>) -> Result<Vec<String>>;
+    /// Execute multiple prompts with optional concurrency limit.
+    /// Returns a result for each prompt (either success string or error object).
+    fn batch(&self, prompts: Vec<String>, max_concurrent: usize) -> Result<Vec<BatchCallResult>>;
     fn budget_snapshot(&self) -> Result<BudgetSnapshot>;
 }
 
@@ -51,9 +94,12 @@ impl LlmHandler {
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
-    fn batch(&self, py: Python<'_>, prompts: Vec<String>) -> PyResult<Vec<String>> {
-        py.detach(|| self.callback.batch(prompts))
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    fn batch(&self, py: Python<'_>, prompts: Vec<String>, max_concurrent: usize) -> PyResult<String> {
+        py.detach(|| {
+            let results = self.callback.batch(prompts, max_concurrent)?;
+            serde_json::to_string(&results).map_err(anyhow::Error::from)
+        })
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
     fn budget_snapshot_json(&self, py: Python<'_>) -> PyResult<String> {
@@ -160,6 +206,24 @@ impl PythonRuntime {
         Python::attach(|py| {
             let locals = self.locals.bind(py);
             locals.set_item("P", context)?;
+            Ok(())
+        })
+    }
+
+    /// Set context metadata (sources and document count) for the stats() builtin.
+    pub fn set_context_metadata(&mut self, sources: &[String], doc_count: usize) -> Result<()> {
+        Python::attach(|py| {
+            let locals = self.locals.bind(py);
+            let state_item = locals
+                .get_item("_state")?
+                .ok_or_else(|| anyhow!("missing _state"))?;
+            let state = state_item
+                .cast::<PyDict>()
+                .map_err(|err| anyhow!(err.to_string()))?;
+            // Convert sources to Python list
+            let sources_list = pyo3::types::PyList::new(py, sources)?;
+            state.set_item("sources", sources_list)?;
+            state.set_item("doc_count", doc_count)?;
             Ok(())
         })
     }
@@ -448,10 +512,19 @@ def find(pattern, flags=None):
 
 
 def stats():
+    """Return context statistics per spec.
+
+    Returns:
+        dict with keys: chars, tokens, lines, docs, sources
+    """
+    sources = _state.get("sources") or []
+    doc_count = _state.get("doc_count", 1)
     return {
-        "length_chars": len(P),
-        "length_tokens": max(1, len(P) // 4),
-        "line_count": P.count("\n") + 1,
+        "chars": len(P),
+        "tokens": max(1, len(P) // 4),
+        "lines": P.count("\n") + 1,
+        "docs": doc_count,
+        "sources": sources,
     }
 
 
@@ -484,11 +557,12 @@ def routing_summary():
     return _state.get("routing_summary")
 
 
-def _record_tool_override(tools):
+def _record_tool_override(tools, builtin="llm_query"):
     events = _state.get("tool_override_events")
     if events is None:
         events = []
     events.append({
+        "builtin": builtin,
         "requested_tools": tools,
         "granted_tools": [],
         "denied_tools": tools,
@@ -512,19 +586,32 @@ def _tool_override_policy():
         return {"allowed_tool_overrides": []}
 
 
-def _evaluate_tool_override(tools):
+def _evaluate_tool_override(tools, builtin="llm_query"):
     policy = _tool_override_policy()
     allowed = set(policy.get("allowed_tool_overrides") or [])
+    require_approval = policy.get("require_approval", False)
     requested = list(tools)
     blocked = [tool for tool in requested if tool.startswith("rlm_")]
-    granted = [tool for tool in requested if tool in allowed and tool not in blocked]
-    denied = [tool for tool in requested if tool not in allowed or tool in blocked]
-    reason = None
-    if blocked:
-        reason = "rlm_tools_not_allowed"
-    elif denied:
-        reason = "requested tools not in allowed_tool_overrides"
+
+    # If require_approval is true, deny all tool overrides until approval plumbing exists.
+    # NOTE: The spec implies an approval gate, but currently we blanket deny because there
+    # is no interactive approval mechanism. When approval plumbing is added, this should
+    # prompt for approval instead of denying outright.
+    if require_approval:
+        granted = []
+        denied = requested
+        reason = "require_approval is true, tool override needs approval (approval plumbing not yet implemented)"
+    else:
+        granted = [tool for tool in requested if tool in allowed and tool not in blocked]
+        denied = [tool for tool in requested if tool not in allowed or tool in blocked]
+        reason = None
+        if blocked:
+            reason = "rlm_tools_not_allowed"
+        elif denied:
+            reason = "requested tools not in allowed_tool_overrides"
+
     event = {
+        "builtin": builtin,
         "requested_tools": requested,
         "granted_tools": granted,
         "denied_tools": denied,
@@ -552,13 +639,23 @@ def llm_query(prompt, tools=None):
     return response
 
 
-def llm_query_batch(prompts):
+def llm_query_batch(prompts, max_concurrent=5):
+    """Execute multiple prompts in parallel with concurrency limit.
+
+    Args:
+        prompts: List of prompt strings
+        max_concurrent: Maximum concurrent calls (default 5)
+
+    Returns:
+        List of results, each either a response string or an error dict:
+        {"error": {"code": "...", "message": "...", "retriable": bool}}
+    """
     handler = _state.get("llm_handler")
     if handler is None:
         raise RuntimeError("llm_query_batch is not configured")
-    responses = handler.batch(prompts)
+    results_json = handler.batch(prompts, max_concurrent)
     _state["budget_json"] = handler.budget_snapshot_json()
-    return responses
+    return json.loads(results_json)
 
 
 def search(query, k=10):
@@ -647,7 +744,7 @@ def list_docs(prefix=""):
         prefix: Optional path prefix to filter documents (e.g., "docs/api/")
 
     Returns:
-        List of dicts with keys: id, size
+        List of dicts with keys: id, path, size, start, end (max 1000 items)
     """
     data = _state.get("document_list_json")
     if not data:
@@ -657,7 +754,8 @@ def list_docs(prefix=""):
     if prefix:
         docs = [d for d in docs if d.get("id", "").startswith(prefix)]
 
-    return docs
+    # Cap at 1000 items per spec
+    return docs[:1000]
 
 
 def agents_files():
