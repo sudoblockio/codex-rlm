@@ -92,6 +92,23 @@ pub use codex_git::GhostSnapshotConfig;
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = None;
 
+/// RLM tool instructions injected when RLM tools are enabled.
+#[cfg(feature = "rlm")]
+const RLM_TOOL_INSTRUCTIONS: &str = r#"
+## RLM Tools (Large Context Processing)
+
+When RLM tools are available, use them for exploring large codebases or documents:
+
+- **rlm_load(path)**: Load file/directory context (resets session state)
+- **rlm_query(prompt)**: Fast read-only scan; prefer for quick questions
+- **rlm_exec(code)**: Python execution for structured extraction + multi-step analysis
+  - Builtins: `peek(start, end)`, `find(pattern)`, `search(query, k)`, `list_docs()`, `stats()`
+  - Set `result = {...}` for structured JSON return
+- **llm_query(prompt)**: Spawn sub-agent on a snippet (inside rlm_exec)
+
+Workflow: rlm_load → rlm_query (quick) or rlm_exec (complex) → iterate as needed.
+"#;
+
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 
 #[cfg(test)]
@@ -1451,7 +1468,33 @@ impl Config {
         let file_base_instructions =
             Self::try_read_non_empty_file(model_instructions_path, "model instructions file")?;
         let base_instructions = base_instructions.or(file_base_instructions);
-        let developer_instructions = developer_instructions.or(cfg.developer_instructions);
+
+        // Compute experimental_supported_tools early so we can use it for RLM instructions
+        let experimental_supported_tools: Vec<String> = config_profile
+            .experimental_supported_tools
+            .clone()
+            .or(cfg.experimental_supported_tools.clone())
+            .unwrap_or_default();
+
+        // Append RLM instructions when RLM tools are enabled
+        #[cfg(feature = "rlm")]
+        let developer_instructions = {
+            let base = developer_instructions.or(cfg.developer_instructions.clone());
+            let has_rlm_tools = experimental_supported_tools
+                .iter()
+                .any(|t| t.starts_with("rlm_"));
+            if has_rlm_tools {
+                Some(match base {
+                    Some(existing) => format!("{}\n{}", existing, RLM_TOOL_INSTRUCTIONS),
+                    None => RLM_TOOL_INSTRUCTIONS.to_string(),
+                })
+            } else {
+                base
+            }
+        };
+        #[cfg(not(feature = "rlm"))]
+        let developer_instructions = developer_instructions.or(cfg.developer_instructions.clone());
+
         let model_personality = model_personality
             .or(config_profile.model_personality)
             .or(cfg.model_personality);
@@ -1560,11 +1603,7 @@ impl Config {
             forced_login_method,
             include_apply_patch_tool: include_apply_patch_tool_flag,
             web_search_mode,
-            experimental_supported_tools: config_profile
-                .experimental_supported_tools
-                .clone()
-                .or(cfg.experimental_supported_tools.clone())
-                .unwrap_or_default(),
+            experimental_supported_tools,
             tool_allowlist: None,
             use_experimental_unified_exec_tool,
             ghost_snapshot,
