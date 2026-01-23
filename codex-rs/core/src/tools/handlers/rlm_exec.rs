@@ -237,6 +237,7 @@ mod tests {
             result_json_error: None,
             tool_override_events_json: None,
             tool_override_denied: false,
+            files_accessed: Vec::new(),
         }
     }
 
