@@ -82,7 +82,9 @@ fn canonicalize(value: &Value) -> Value {
 /// Render the config schema as pretty-printed JSON.
 pub fn config_schema_json() -> anyhow::Result<Vec<u8>> {
     let schema = config_schema();
-    let json = serde_json::to_vec_pretty(&schema)?;
+    let value = serde_json::to_value(schema)?;
+    let value = canonicalize(&value);
+    let json = serde_json::to_vec_pretty(&value)?;
     Ok(json)
 }
 
