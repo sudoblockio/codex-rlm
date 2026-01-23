@@ -39,6 +39,9 @@ pub struct ConfigProfile {
     pub tools_web_search: Option<bool>,
     pub tools_view_image: Option<bool>,
     pub web_search: Option<WebSearchMode>,
+    /// Additional tools to enable (e.g., ["rlm_load", "rlm_exec"]).
+    #[serde(default)]
+    pub experimental_supported_tools: Option<Vec<String>>,
     pub analytics: Option<crate::config::types::AnalyticsConfigToml>,
     /// Optional feature toggles scoped to this profile.
     #[serde(default)]

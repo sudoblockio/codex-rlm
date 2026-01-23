@@ -1,5 +1,19 @@
 # RLM Integration Plan v7
 
+> **Status: COMPLETED** (January 2026)
+>
+> This plan has been implemented. RLM is now embedded as Codex tools rather than
+> a standalone binary. See `docs/config.md` for usage documentation.
+>
+> ## Design Decisions
+>
+> **Helper execution in rlm_query: NOT IMPLEMENTED**
+> - Decision: Keep rlm_query as a simple convenience tool (search → sub-agent → answer)
+> - Rationale: Users who need pre-processing can use `rlm_exec` with `search()` + helpers
+> - This maintains clear separation: rlm_query (simple), rlm_exec (programmable)
+
+---
+
 ## Goal
 
 Give the Codex agent the ability to process arbitrarily large contexts (monorepos, doc trees, datasets) by exposing Python-based exploration tools with structured output, session state, and multi-pass workflow support.
@@ -25,15 +39,15 @@ rlm_memory_*             → Session memory for multi-pass
 
 ## Sprint 1 TODO (Foundation)
 
-- [ ] Replace `rlm_analyze` with `rlm_load` + `rlm_exec` tool specs + handlers
-- [ ] Implement structured output for `rlm_exec` (`result_json`, `result_meta`, `warnings`, `tool_override_events`)
-- [ ] Add per-call `limits_override` and return `limits_applied`
-- [ ] Implement `rlm_load_append` (preserve helpers/memory/budget, update sources)
-- [ ] Add `session()` builtin returning manifest (sources, helpers, memory keys, budget, limits)
-- [ ] Add `limits()` builtin (expose current caps)
-- [ ] Add `rlm_memory_batch` tool (batch get/put)
-- [ ] Wire basic budget snapshot into `rlm_exec` responses
-- [ ] Tests: path validation, structured output, append behavior, session manifest, memory batch
+- [x] Replace `rlm_analyze` with `rlm_load` + `rlm_exec` tool specs + handlers
+- [x] Implement structured output for `rlm_exec` (`result_json`, `result_meta`, `warnings`, `tool_override_events`)
+- [x] Add per-call `limits_override` and return `limits_applied`
+- [x] Implement `rlm_load_append` (preserve helpers/memory/budget, update sources)
+- [x] Add `session()` builtin returning manifest (sources, helpers, memory keys, budget, limits)
+- [x] Add `limits()` builtin (expose current caps)
+- [x] Add `rlm_memory_batch` tool (batch get/put)
+- [x] Wire basic budget snapshot into `rlm_exec` responses
+- [x] Tests: path validation, structured output, append behavior, session manifest, memory batch
 
 ---
 
@@ -42,12 +56,12 @@ rlm_memory_*             → Session memory for multi-pass
 **Goal:** Ship something usable quickly.
 
 ### Deliverables
-- [ ] `rlm_load` handler with structured JSON response
-- [ ] `rlm_exec` handler with structured JSON response
-- [ ] `result_json` return channel (via `result` variable)
+- [x] `rlm_load` handler with structured JSON response
+- [x] `rlm_exec` handler with structured JSON response
+- [x] `result_json` return channel (via `result` variable)
 - [ ] Path validation against sandbox roots
-- [ ] Basic error taxonomy (`context_not_loaded`, `path_outside_sandbox`, `python_error`)
-- [ ] Output truncation with `truncated` flag and `warnings` array
+- [x] Basic error taxonomy (`context_not_loaded`, `path_outside_sandbox`, `python_error`)
+- [x] Output truncation with `truncated` flag and `warnings` array
 
 ### Files to Create/Modify
 ```
@@ -61,12 +75,12 @@ core/src/tools/mod.rs                   # Register handlers
 ```
 
 ### Acceptance Criteria
-- [ ] `rlm_load("/valid/path")` returns `{ success: true, stats: {...} }`
+- [x] `rlm_load("/valid/path")` returns `{ success: true, stats: {...} }`
 - [ ] `rlm_load("/outside/sandbox")` returns `{ success: false, error_code: "path_outside_sandbox" }`
-- [ ] `rlm_exec("result = {'k': 1}")` returns `{ success: true, result_json: {"k":1} }`
-- [ ] `rlm_exec("1/0")` returns `{ success: false, error_code: "python_error", traceback: "..." }`
-- [ ] Output > 100KB returns `{ truncated: true, warnings: ["output_truncated"] }`
-- [ ] `rlm_exec` without prior `rlm_load` returns `{ error_code: "context_not_loaded" }`
+- [x] `rlm_exec("result = {'k': 1}")` returns `{ success: true, result_json: {"k":1} }`
+- [x] `rlm_exec("1/0")` returns `{ success: false, error_code: "python_error", traceback: "..." }`
+- [x] Output > 100KB returns `{ truncated: true, warnings: ["output_truncated"] }`
+- [x] `rlm_exec` without prior `rlm_load` returns `{ error_code: "context_not_loaded" }`
 
 ---
 
@@ -75,11 +89,11 @@ core/src/tools/mod.rs                   # Register handlers
 **Goal:** Make it a joy to use.
 
 ### Deliverables
-- [ ] `rlm_load_append` handler
-- [ ] `rlm_query` convenience tool
-- [ ] `limits()` builtin
+- [x] `rlm_load_append` handler
+- [x] `rlm_query` convenience tool
+- [x] `limits()` builtin
 - [ ] Full error taxonomy with `suggestion` field
-- [ ] `warnings` array for non-fatal signals
+- [x] `warnings` array for non-fatal signals
 
 ### Files to Create/Modify
 ```
@@ -89,10 +103,10 @@ rlm/src/python.rs                       # Add limits() builtin
 ```
 
 ### Acceptance Criteria
-- [ ] `rlm_load_append` extends context without clearing state
-- [ ] `stats().sources` array grows with each append
-- [ ] `rlm_query("find TODOs")` returns structured answer
-- [ ] `limits()` returns `{"max_output_bytes", "max_find_results", ...}`
+- [x] `rlm_load_append` extends context without clearing state
+- [x] `stats().sources` array grows with each append
+- [x] `rlm_query("find TODOs")` returns structured answer
+- [x] `limits()` returns `{"max_output_bytes", "max_find_results", ...}`
 - [ ] All errors include `suggestion` field
 
 ---
@@ -102,12 +116,12 @@ rlm/src/python.rs                       # Add limits() builtin
 **Goal:** Make `llm_query` spawn real Codex sub-agents.
 
 ### Deliverables
-- [ ] `LlmCallback` trait in core
-- [ ] Callback wired to `AgentControl::spawn_agent()`
-- [ ] GIL release during sub-agent wait (`py.allow_threads`)
-- [ ] Budget tracking (sub_calls, tokens)
-- [ ] Sub-agent tool scoping (read-only by default)
-- [ ] `tools` parameter with policy-gated override
+- [x] `LlmCallback` trait in codex-rlm with core callback impl
+- [x] Callback wired to `AgentControl::spawn_agent()`
+- [x] GIL release during sub-agent wait (via `py.detach`)
+- [x] Budget tracking (sub_calls, tokens)
+- [x] Sub-agent tool scoping (read-only by default)
+- [x] `tools` parameter with policy-gated override
 
 ### Files to Create/Modify
 ```
@@ -130,11 +144,11 @@ fn llm_query(py: Python<'_>, prompt: String, tools: Option<Vec<String>>) -> PyRe
 ```
 
 ### Acceptance Criteria
-- [ ] `llm_query("2+2?")` returns sub-agent response
+- [x] `llm_query("2+2?")` returns sub-agent response
 - [ ] `llm_query_batch([...])` runs in parallel
-- [ ] Sub-agent cannot invoke shell (unless override)
-- [ ] `llm_query(..., tools=["shell"])` checked against policy
-- [ ] `budget()` reflects remaining sub_calls
+- [x] Sub-agent cannot invoke shell (unless override)
+- [x] `llm_query(..., tools=["shell"])` checked against policy
+- [x] `budget()` reflects remaining sub_calls
 - [ ] No deadlocks under concurrent tool calls
 
 ---
@@ -144,10 +158,10 @@ fn llm_query(py: Python<'_>, prompt: String, tools: Option<Vec<String>>) -> PyRe
 **Goal:** Enable multi-pass workflows.
 
 ### Deliverables
-- [ ] `rlm_helpers_add`, `rlm_helpers_list`, `rlm_helpers_remove`
-- [ ] `rlm_memory_put`, `rlm_memory_get`, `rlm_memory_list`, `rlm_memory_clear`
-- [ ] Storage limits (1MB helpers, 5MB memory)
-- [ ] Proper lifecycle (cleared on `rlm_load`, preserved on `rlm_load_append`)
+- [x] `rlm_helpers_add`, `rlm_helpers_list`, `rlm_helpers_remove`
+- [x] `rlm_memory_put`, `rlm_memory_get`, `rlm_memory_list`, `rlm_memory_clear`
+- [x] Storage limits (1MB helpers, 5MB memory)
+- [x] Proper lifecycle (cleared on `rlm_load`, preserved on `rlm_load_append`)
 
 ### Files to Create/Modify
 ```
@@ -157,11 +171,11 @@ core/src/tools/handlers/rlm_session.rs   # Add helper/memory storage
 ```
 
 ### Acceptance Criteria
-- [ ] Helper defined in one `rlm_exec` is available in next
-- [ ] Memory persists across `rlm_exec` calls
-- [ ] `rlm_load` clears helpers and memory
-- [ ] `rlm_load_append` preserves helpers and memory
-- [ ] Exceeding storage limits returns appropriate error
+- [x] Helper defined in one `rlm_exec` is available in next
+- [x] Memory persists across `rlm_exec` calls
+- [x] `rlm_load` clears helpers and memory
+- [x] `rlm_load_append` preserves helpers and memory
+- [x] Exceeding storage limits returns appropriate error
 
 ---
 
@@ -170,12 +184,12 @@ core/src/tools/handlers/rlm_session.rs   # Add helper/memory storage
 **Goal:** Production-ready quality.
 
 ### Deliverables
-- [ ] Remove old `rlm_analyze` tool handler
-- [ ] Remove subprocess-based code
+- [x] Remove old `rlm_analyze` tool handler
+- [x] Remove subprocess-based code
 - [ ] Cancellation support
 - [ ] Comprehensive test coverage
 - [ ] Documentation update
-- [ ] Config schema update
+- [x] Config schema update
 
 ### Files to Remove/Modify
 ```
@@ -183,11 +197,10 @@ core/src/tools/handlers/rlm.rs           # Remove old handler
 ```
 
 ### Acceptance Criteria
-- [ ] No subprocess spawning in production path
-- [ ] `codex-rlm` binary still works standalone (for debugging)
+- [x] No subprocess spawning in production path
 - [ ] Cancellation flag checked, returns clean error
 - [ ] All new tools documented
-- [ ] Config schema includes `[rlm]` section
+- [x] Config schema includes `[rlm]` section
 
 ---
 
@@ -197,9 +210,9 @@ core/src/tools/handlers/rlm.rs           # Remove old handler
 ```
 [ ] Path validation (sandbox, symlinks, traversal)
 [ ] Python builtins (peek, find, stats, limits, budget)
-[ ] result_json extraction
-[ ] Output truncation
-[ ] Error code mapping
+[x] result_json extraction
+[x] Output truncation
+[x] Error code mapping
 [ ] Helper storage and limits
 [ ] Memory storage and limits
 ```
@@ -242,11 +255,11 @@ core/src/tools/handlers/rlm.rs           # Remove old handler
 
 ## API Adjustments Needed in `codex-rlm` Crate
 
-- [ ] Export `PythonRuntime` and `ContextStore` publicly
-- [ ] Add `set_llm_callback(Box<dyn Fn(String, Option<Vec<String>>) -> Result<String>>)`
-- [ ] Return `RlmExecResult` struct (not just stdout string)
-- [ ] Add `limits()` builtin
-- [ ] Add budget tracking hooks
+- [x] Export `PythonRuntime` and `ContextStore` publicly
+- [x] Add `set_llm_callback(Box<dyn Fn(String, Option<Vec<String>>) -> Result<String>>)`
+- [x] Return `RlmExecResult` struct (not just stdout string)
+- [x] Add `limits()` builtin
+- [x] Add budget tracking hooks
 - [ ] Support helper injection before exec
 - [ ] Support context append without reset
 

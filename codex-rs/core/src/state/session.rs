@@ -1,12 +1,18 @@
 //! Session-wide mutable state.
 
 use codex_protocol::models::ResponseItem;
+#[cfg(feature = "rlm")]
+use std::sync::Arc;
+#[cfg(feature = "rlm")]
+use tokio::sync::Mutex;
 
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
+#[cfg(feature = "rlm")]
+use crate::rlm_session::RlmSession;
 use crate::truncate::TruncationPolicy;
 
 /// Persistent, session-scoped state previously stored directly on `Session`.
@@ -15,6 +21,8 @@ pub(crate) struct SessionState {
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) server_reasoning_included: bool,
+    #[cfg(feature = "rlm")]
+    pub(crate) rlm_session: Option<Arc<Mutex<RlmSession>>>,
 }
 
 impl SessionState {
@@ -26,6 +34,8 @@ impl SessionState {
             history,
             latest_rate_limits: None,
             server_reasoning_included: false,
+            #[cfg(feature = "rlm")]
+            rlm_session: None,
         }
     }
 

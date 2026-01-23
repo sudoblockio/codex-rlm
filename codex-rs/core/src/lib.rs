@@ -45,6 +45,10 @@ mod model_provider_info;
 pub mod parse_command;
 pub mod path_utils;
 pub mod powershell;
+#[cfg(feature = "rlm")]
+mod rlm_session;
+#[cfg(feature = "rlm")]
+mod rlm_sub_agent;
 pub mod sandboxing;
 mod session_prefix;
 mod stream_events_utils;

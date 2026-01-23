@@ -201,6 +201,13 @@ impl ToolRegistryBuilder {
         }
     }
 
+    pub fn retain_allowed_tools(&mut self, allowlist: &std::collections::HashSet<String>) {
+        self.specs
+            .retain(|spec| allowlist.contains(spec.spec.name()));
+        self.handlers
+            .retain(|name, _| allowlist.contains(name.as_str()));
+    }
+
     // TODO(jif) for dynamic tools.
     // pub fn register_many<I>(&mut self, names: I, handler: Arc<dyn ToolHandler>)
     // where
