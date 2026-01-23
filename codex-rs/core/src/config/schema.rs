@@ -8,6 +8,8 @@ use schemars::schema::ObjectValidation;
 use schemars::schema::RootSchema;
 use schemars::schema::Schema;
 use schemars::schema::SchemaObject;
+use serde_json::Map;
+use serde_json::Value;
 use std::path::Path;
 
 /// Schema for the `[features]` map with known + legacy keys only.
@@ -60,6 +62,23 @@ pub fn config_schema() -> RootSchema {
         .into_root_schema_for::<ConfigToml>()
 }
 
+/// Canonicalize a JSON value by sorting its keys.
+fn canonicalize(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let mut sorted = Map::with_capacity(map.len());
+            for (key, child) in entries {
+                sorted.insert(key.clone(), canonicalize(child));
+            }
+            Value::Object(sorted)
+        }
+        _ => value.clone(),
+    }
+}
+
 /// Render the config schema as pretty-printed JSON.
 pub fn config_schema_json() -> anyhow::Result<Vec<u8>> {
     let schema = config_schema();
@@ -76,26 +95,10 @@ pub fn write_config_schema(out_path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::canonicalize;
     use super::config_schema_json;
-    use serde_json::Map;
-    use serde_json::Value;
-    use similar::TextDiff;
 
-    fn canonicalize(value: &Value) -> Value {
-        match value {
-            Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
-            Value::Object(map) => {
-                let mut entries: Vec<_> = map.iter().collect();
-                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-                let mut sorted = Map::with_capacity(map.len());
-                for (key, child) in entries {
-                    sorted.insert(key.clone(), canonicalize(child));
-                }
-                Value::Object(sorted)
-            }
-            _ => value.clone(),
-        }
-    }
+    use similar::TextDiff;
 
     #[test]
     fn config_schema_matches_fixture() {
