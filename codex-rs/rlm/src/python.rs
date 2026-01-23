@@ -22,9 +22,7 @@ pub enum BatchCallResult {
     /// Successful response string.
     Success(String),
     /// Error object with code, message, and retriable flag.
-    Error {
-        error: BatchCallError,
-    },
+    Error { error: BatchCallError },
 }
 
 /// Error details for a failed batch call.
@@ -94,7 +92,12 @@ impl LlmHandler {
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
-    fn batch(&self, py: Python<'_>, prompts: Vec<String>, max_concurrent: usize) -> PyResult<String> {
+    fn batch(
+        &self,
+        py: Python<'_>,
+        prompts: Vec<String>,
+        max_concurrent: usize,
+    ) -> PyResult<String> {
         py.detach(|| {
             let results = self.callback.batch(prompts, max_concurrent)?;
             serde_json::to_string(&results).map_err(anyhow::Error::from)
@@ -317,7 +320,10 @@ impl PythonRuntime {
         })
     }
 
-    pub fn set_search_callback(&mut self, callback: std::sync::Arc<dyn SearchCallback>) -> Result<()> {
+    pub fn set_search_callback(
+        &mut self,
+        callback: std::sync::Arc<dyn SearchCallback>,
+    ) -> Result<()> {
         self.search_callback = Some(callback.clone());
         Python::attach(|py| {
             let locals = self.locals.bind(py);

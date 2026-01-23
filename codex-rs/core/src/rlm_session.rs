@@ -7,6 +7,8 @@ use std::sync::Mutex as StdMutex;
 use anyhow::Result;
 use codex_rlm::BudgetSnapshot;
 use codex_rlm::RlmConfig;
+use codex_rlm::SearchCallback;
+use codex_rlm::SearchResultJson;
 use codex_rlm::context::ContextSource;
 use codex_rlm::context::ContextStore;
 use codex_rlm::context::ContextStoreKind;
@@ -19,8 +21,6 @@ use codex_rlm::python::ExecutionResult;
 use codex_rlm::python::LlmCallback;
 use codex_rlm::python::PythonRuntime;
 use codex_rlm::python::ResourceLimits;
-use codex_rlm::SearchCallback;
-use codex_rlm::SearchResultJson;
 use codex_rlm::routing::HierarchicalRoutingGraph;
 use serde::Deserialize;
 use serde::Serialize;
@@ -451,7 +451,13 @@ impl RlmSession {
     fn estimate_total_memory(&self) -> usize {
         let context_bytes = self.context.len();
         // BM25 index is estimated at ~2x context size when built
-        let index_estimate = if self.bm25_index.lock().ok().and_then(|g| g.as_ref().map(|_| ())).is_some() {
+        let index_estimate = if self
+            .bm25_index
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|_| ()))
+            .is_some()
+        {
             context_bytes * 2
         } else {
             // Index will be built on first search, so account for it
@@ -546,12 +552,7 @@ impl RlmSession {
             return code.to_string();
         }
         // Pre-calculate total capacity: each helper contributes code + up to 2 newlines
-        let capacity = self
-            .helpers
-            .iter()
-            .map(|h| h.code.len() + 2)
-            .sum::<usize>()
-            + code.len();
+        let capacity = self.helpers.iter().map(|h| h.code.len() + 2).sum::<usize>() + code.len();
         let mut combined = String::with_capacity(capacity);
         for helper in &self.helpers {
             combined.push_str(&helper.code);
@@ -617,9 +618,10 @@ impl RlmSession {
 
     fn sync_budget_from_python(&mut self) -> Result<()> {
         if let Some(snapshot) = self.python.budget()?
-            && let Ok(mut guard) = self.budget_state.lock() {
-                *guard = snapshot;
-            }
+            && let Ok(mut guard) = self.budget_state.lock()
+        {
+            *guard = snapshot;
+        }
         Ok(())
     }
 }
@@ -810,7 +812,9 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = session.exec("print('hello world')", None, None, None).unwrap();
+        let outcome = session
+            .exec("print('hello world')", None, None, None)
+            .unwrap();
         assert!(outcome.result.error.is_none());
         assert!(outcome.result.output.contains("hello world"));
     }
@@ -905,19 +909,13 @@ mod tests {
             .unwrap();
 
         // Verify memory persists
-        assert_eq!(
-            session.memory_get("counter"),
-            Some(serde_json::json!(1))
-        );
+        assert_eq!(session.memory_get("counter"), Some(serde_json::json!(1)));
 
         // Update value via exec (indirectly via session manifest)
         session
             .memory_put("counter".to_string(), serde_json::json!(2))
             .unwrap();
-        assert_eq!(
-            session.memory_get("counter"),
-            Some(serde_json::json!(2))
-        );
+        assert_eq!(session.memory_get("counter"), Some(serde_json::json!(2)));
     }
 
     #[tokio::test]
@@ -1206,10 +1204,7 @@ result = {
 
         // First exec: define a value in memory via helper
         session
-            .helpers_add(
-                "store".to_string(),
-                "stored_value = 42\n".to_string(),
-            )
+            .helpers_add("store".to_string(), "stored_value = 42\n".to_string())
             .unwrap();
 
         // First exec: use the helper
@@ -1355,19 +1350,25 @@ result = {
 
         // Add a large helper
         let large_code = "x = ".to_string() + &"0".repeat(HELPERS_LIMIT_BYTES - 1000);
-        session.helpers_add("large".to_string(), large_code).unwrap();
+        session
+            .helpers_add("large".to_string(), large_code)
+            .unwrap();
 
         // Try to add another - should fail
         let small_code = "y = ".to_string() + &"1".repeat(2000);
-        assert!(session
-            .helpers_add("small".to_string(), small_code.clone())
-            .is_err());
+        assert!(
+            session
+                .helpers_add("small".to_string(), small_code.clone())
+                .is_err()
+        );
 
         // Remove the large helper
         session.helpers_remove("large").unwrap();
 
         // Now the small one should succeed
-        session.helpers_add("small".to_string(), small_code).unwrap();
+        session
+            .helpers_add("small".to_string(), small_code)
+            .unwrap();
         assert_eq!(session.helpers_list(), vec!["small".to_string()]);
     }
 
@@ -1383,9 +1384,11 @@ result = {
 
         // Try to add more - should fail
         let small_value = "y".repeat(2000);
-        assert!(session
-            .memory_put("small".to_string(), serde_json::json!(small_value.clone()))
-            .is_err());
+        assert!(
+            session
+                .memory_put("small".to_string(), serde_json::json!(small_value))
+                .is_err()
+        );
 
         // Clear memory
         session.memory_clear().unwrap();
@@ -1403,14 +1406,18 @@ result = {
 
         let name1 = "helper1";
         let code1 = "def f(): return 1";
-        session.helpers_add(name1.to_string(), code1.to_string()).unwrap();
+        session
+            .helpers_add(name1.to_string(), code1.to_string())
+            .unwrap();
 
         let expected = name1.len() + code1.len();
         assert_eq!(session.helpers_bytes_used(), expected);
 
         let name2 = "helper2";
         let code2 = "def g(): return 2";
-        session.helpers_add(name2.to_string(), code2.to_string()).unwrap();
+        session
+            .helpers_add(name2.to_string(), code2.to_string())
+            .unwrap();
 
         let expected2 = expected + name2.len() + code2.len();
         assert_eq!(session.helpers_bytes_used(), expected2);

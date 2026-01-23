@@ -99,6 +99,7 @@ which = { workspace = true }
 wildmatch = { workspace = true }
 
 [features]
+default = ["rlm"]
 deterministic_process_ids = []
 test-support = []
 rlm = ["codex-rlm"]

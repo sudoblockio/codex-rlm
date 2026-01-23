@@ -382,14 +382,14 @@ impl LlmCallback for RlmSubAgentCallback {
                 Err(err) => {
                     // Categorize the error
                     let err_str = err.to_string();
-                    let (code, retriable) = if err_str.contains("timeout") || err_str.contains("timed out")
-                    {
-                        ("timeout", true)
-                    } else if err_str.contains("budget") {
-                        ("budget_exceeded", false)
-                    } else {
-                        ("sub_agent_error", true)
-                    };
+                    let (code, retriable) =
+                        if err_str.contains("timeout") || err_str.contains("timed out") {
+                            ("timeout", true)
+                        } else if err_str.contains("budget") {
+                            ("budget_exceeded", false)
+                        } else {
+                            ("sub_agent_error", true)
+                        };
                     BatchCallResult::error(code, err_str, retriable)
                 }
             })
@@ -612,8 +612,9 @@ mod tests {
     #[test]
     fn concurrent_budget_exhaustion_is_safe() {
         // Test that concurrent reservations don't go negative when budget is limited
+        use std::sync::atomic::AtomicU32;
+        use std::sync::atomic::Ordering;
         use std::thread;
-        use std::sync::atomic::{AtomicU32, Ordering};
 
         let budget = BudgetSnapshot::new(10000, 5, 100, 60000);
         let budget_state = Arc::new(StdMutex::new(budget));

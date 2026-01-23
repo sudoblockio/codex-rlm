@@ -110,6 +110,18 @@ pub struct Cli {
     #[arg(long = "no-alt-screen", default_value_t = false)]
     pub no_alt_screen: bool,
 
+    /// Enable RLM (Recursive Language Model) mode for advanced context handling and Python execution.
+    #[arg(long = "rlm", default_value_t = true)]
+    pub rlm: bool,
+
+    /// RLM context directory or file path to load.
+    #[arg(long = "rlm-context", value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
+    pub rlm_context: Option<PathBuf>,
+
+    /// RLM text context to load directly.
+    #[arg(long = "rlm-text", value_name = "TEXT")]
+    pub rlm_text: Option<String>,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }

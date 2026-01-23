@@ -334,10 +334,12 @@ mod tests {
         };
         let value: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(value["error_code"], "policy_violation");
-        assert!(value["suggestion"]
-            .as_str()
-            .unwrap()
-            .contains("request approval"));
+        assert!(
+            value["suggestion"]
+                .as_str()
+                .unwrap()
+                .contains("request approval")
+        );
     }
 
     #[test]
