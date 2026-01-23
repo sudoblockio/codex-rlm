@@ -20,6 +20,7 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolsConfig {
@@ -29,12 +30,16 @@ pub(crate) struct ToolsConfig {
     pub collab_tools: bool,
     pub collaboration_modes_tools: bool,
     pub experimental_supported_tools: Vec<String>,
+    pub tool_allowlist: Option<HashSet<String>>,
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
     pub(crate) model_info: &'a ModelInfo,
     pub(crate) features: &'a Features,
     pub(crate) web_search_mode: Option<WebSearchMode>,
+    /// User-configured experimental tools (from config.toml).
+    pub(crate) user_experimental_tools: &'a [String],
+    pub(crate) tool_allowlist: Option<&'a [String]>,
 }
 
 impl ToolsConfig {
@@ -43,6 +48,8 @@ impl ToolsConfig {
             model_info,
             features,
             web_search_mode,
+            user_experimental_tools,
+            tool_allowlist,
         } = params;
         let include_apply_patch_tool = features.enabled(Feature::ApplyPatchFreeform);
         let include_collab_tools = features.enabled(Feature::Collab);
@@ -79,7 +86,17 @@ impl ToolsConfig {
             web_search_mode: *web_search_mode,
             collab_tools: include_collab_tools,
             collaboration_modes_tools: include_collaboration_modes_tools,
-            experimental_supported_tools: model_info.experimental_supported_tools.clone(),
+            experimental_supported_tools: {
+                // Merge model's tools with user-configured tools
+                let mut tools = model_info.experimental_supported_tools.clone();
+                for tool in *user_experimental_tools {
+                    if !tools.contains(tool) {
+                        tools.push(tool.clone());
+                    }
+                }
+                tools
+            },
+            tool_allowlist: tool_allowlist.map(|list| list.iter().cloned().collect()),
         }
     }
 }
@@ -706,6 +723,15 @@ fn create_test_sync_tool() -> ToolSpec {
 }
 
 fn create_grep_files_tool() -> ToolSpec {
+    create_grep_files_tool_with_name("grep_files")
+}
+
+/// Alias for grep_files (spec-defined name).
+fn create_grep_tool() -> ToolSpec {
+    create_grep_files_tool_with_name("grep")
+}
+
+fn create_grep_files_tool_with_name(name: &str) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "pattern".to_string(),
@@ -743,7 +769,7 @@ fn create_grep_files_tool() -> ToolSpec {
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "grep_files".to_string(),
+        name: name.to_string(),
         description: "Finds files whose contents match the pattern and lists them by modification \
                       time."
             .to_string(),
@@ -860,6 +886,15 @@ fn create_read_file_tool() -> ToolSpec {
 }
 
 fn create_list_dir_tool() -> ToolSpec {
+    create_list_dir_tool_with_name("list_dir")
+}
+
+/// Alias for list_dir (spec-defined name).
+fn create_glob_tool() -> ToolSpec {
+    create_list_dir_tool_with_name("glob")
+}
+
+fn create_list_dir_tool_with_name(name: &str) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "dir_path".to_string(),
@@ -892,7 +927,7 @@ fn create_list_dir_tool() -> ToolSpec {
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "list_dir".to_string(),
+        name: name.to_string(),
         description:
             "Lists entries in a local directory with 1-indexed entry numbers and simple type labels."
                 .to_string(),
@@ -1098,6 +1133,333 @@ pub(crate) fn mcp_tool_to_openai_tool(
         description: description.unwrap_or_default(),
         strict: false,
         parameters: input_schema,
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_load_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "path".to_string(),
+        JsonSchema::String {
+            description: Some("Absolute path to file or directory to load.".to_string()),
+        },
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_load".to_string(),
+        description: "Load a large context (file or directory) for programmatic exploration. Resets all Python state, helpers, memory, and budget. Path must be absolute and within sandbox."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["path".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_load_append_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "path".to_string(),
+        JsonSchema::String {
+            description: Some("Absolute path to file or directory to append.".to_string()),
+        },
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_load_append".to_string(),
+        description: "Append additional context to the current session. Preserves Python variables, helpers, memory, and budget."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["path".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_exec_tool() -> ToolSpec {
+    let limits_properties = BTreeMap::from([
+        (
+            "max_output_bytes".to_string(),
+            JsonSchema::Number {
+                description: Some("Override max output bytes for this call.".to_string()),
+            },
+        ),
+        (
+            "max_execution_ms".to_string(),
+            JsonSchema::Number {
+                description: Some("Override max execution time in milliseconds.".to_string()),
+            },
+        ),
+        (
+            "max_find_results".to_string(),
+            JsonSchema::Number {
+                description: Some("Override max find() results for this call.".to_string()),
+            },
+        ),
+    ]);
+    let properties = BTreeMap::from([
+        (
+            "code".to_string(),
+            JsonSchema::String {
+                description: Some("Python code to execute.".to_string()),
+            },
+        ),
+        (
+            "limits_override".to_string(),
+            JsonSchema::Object {
+                properties: limits_properties,
+                required: None,
+                additional_properties: Some(false.into()),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_exec".to_string(),
+        description:
+            "Execute Python code to explore the loaded context. Builtins: peek, find, llm_query, session, stats, limits, budget, find_routes, list_docs. Set 'result' for JSON return and 'result_meta' for metadata."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["code".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_helpers_add_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "name".to_string(),
+            JsonSchema::String {
+                description: Some("Helper name.".to_string()),
+            },
+        ),
+        (
+            "code".to_string(),
+            JsonSchema::String {
+                description: Some("Python code defining helper functions.".to_string()),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_helpers_add".to_string(),
+        description: "Define a session-scoped helper (appends in insertion order).".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["name".to_string(), "code".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_helpers_list_tool() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_helpers_list".to_string(),
+        description: "List helper names in insertion order.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_helpers_remove_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "name".to_string(),
+        JsonSchema::String {
+            description: Some("Helper name.".to_string()),
+        },
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_helpers_remove".to_string(),
+        description: "Remove a helper by name.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["name".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_memory_put_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "key".to_string(),
+            JsonSchema::String {
+                description: Some("Memory key.".to_string()),
+            },
+        ),
+        (
+            "value".to_string(),
+            JsonSchema::Object {
+                properties: BTreeMap::new(),
+                required: None,
+                additional_properties: Some(true.into()),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_memory_put".to_string(),
+        description: "Store a JSON value in session memory (overwrites if key exists).".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["key".to_string(), "value".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_memory_get_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "key".to_string(),
+        JsonSchema::String {
+            description: Some("Memory key.".to_string()),
+        },
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_memory_get".to_string(),
+        description: "Retrieve a JSON value from session memory.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["key".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_memory_list_tool() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_memory_list".to_string(),
+        description: "List session memory keys.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_memory_clear_tool() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_memory_clear".to_string(),
+        description: "Clear all session memory.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_memory_batch_tool() -> ToolSpec {
+    let op_properties = BTreeMap::from([
+        (
+            "op".to_string(),
+            JsonSchema::String {
+                description: Some("Operation: put or get.".to_string()),
+            },
+        ),
+        (
+            "key".to_string(),
+            JsonSchema::String {
+                description: Some("Memory key.".to_string()),
+            },
+        ),
+        (
+            "value".to_string(),
+            JsonSchema::Object {
+                properties: BTreeMap::new(),
+                required: None,
+                additional_properties: Some(true.into()),
+            },
+        ),
+    ]);
+    let properties = BTreeMap::from([(
+        "ops".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::Object {
+                properties: op_properties,
+                required: Some(vec!["op".to_string(), "key".to_string()]),
+                additional_properties: Some(false.into()),
+            }),
+            description: Some("Batch operations.".to_string()),
+        },
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_memory_batch".to_string(),
+        description: "Batch memory operations (put/get).".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["ops".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+#[cfg(feature = "rlm")]
+fn create_rlm_query_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "prompt".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Question or task to run against the loaded context.".to_string(),
+                ),
+            },
+        ),
+        (
+            "max_sections".to_string(),
+            JsonSchema::Number {
+                description: Some("Maximum sections to analyze (default 10, max 50).".to_string()),
+            },
+        ),
+        (
+            "search_strategy".to_string(),
+            JsonSchema::String {
+                description: Some("Search strategy: regex, bm25, routing, or auto.".to_string()),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "rlm_query".to_string(),
+        description: "Quick read-only analysis of loaded context without writing Python. Does NOT modify helpers or memory."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["prompt".to_string()]),
+            additional_properties: Some(false.into()),
+        },
     })
 }
 
@@ -1310,6 +1672,16 @@ pub(crate) fn build_specs(
         builder.register_handler("grep_files", grep_files_handler);
     }
 
+    // grep is an alias for grep_files (spec-defined name)
+    if config
+        .experimental_supported_tools
+        .contains(&"grep".to_string())
+    {
+        let grep_handler = Arc::new(GrepFilesHandler);
+        builder.push_spec_with_parallel_support(create_grep_tool(), true);
+        builder.register_handler("grep", grep_handler);
+    }
+
     if config
         .experimental_supported_tools
         .contains(&"read_file".to_string())
@@ -1329,6 +1701,17 @@ pub(crate) fn build_specs(
         builder.register_handler("list_dir", list_dir_handler);
     }
 
+    // glob is an alias for list_dir (spec-defined name)
+    if config
+        .experimental_supported_tools
+        .iter()
+        .any(|tool| tool == "glob")
+    {
+        let glob_handler = Arc::new(ListDirHandler);
+        builder.push_spec_with_parallel_support(create_glob_tool(), true);
+        builder.register_handler("glob", glob_handler);
+    }
+
     if config
         .experimental_supported_tools
         .contains(&"test_sync_tool".to_string())
@@ -1336,6 +1719,111 @@ pub(crate) fn build_specs(
         let test_sync_handler = Arc::new(TestSyncHandler);
         builder.push_spec_with_parallel_support(create_test_sync_tool(), true);
         builder.register_handler("test_sync_tool", test_sync_handler);
+    }
+
+    #[cfg(feature = "rlm")]
+    {
+        use crate::tools::handlers::RlmExecHandler;
+        use crate::tools::handlers::RlmHelpersHandler;
+        use crate::tools::handlers::RlmLoadAppendHandler;
+        use crate::tools::handlers::RlmLoadHandler;
+        use crate::tools::handlers::RlmMemoryHandler;
+        use crate::tools::handlers::RlmQueryHandler;
+
+        if config
+            .experimental_supported_tools
+            .contains(&"rlm_load".to_string())
+        {
+            let rlm_load_handler = Arc::new(RlmLoadHandler);
+            builder.push_spec(create_rlm_load_tool());
+            builder.register_handler("rlm_load", rlm_load_handler);
+        }
+
+        if config
+            .experimental_supported_tools
+            .contains(&"rlm_load_append".to_string())
+        {
+            let rlm_load_append_handler = Arc::new(RlmLoadAppendHandler);
+            builder.push_spec(create_rlm_load_append_tool());
+            builder.register_handler("rlm_load_append", rlm_load_append_handler);
+        }
+
+        if config
+            .experimental_supported_tools
+            .contains(&"rlm_exec".to_string())
+        {
+            let rlm_exec_handler = Arc::new(RlmExecHandler);
+            builder.push_spec(create_rlm_exec_tool());
+            builder.register_handler("rlm_exec", rlm_exec_handler);
+        }
+
+        if config
+            .experimental_supported_tools
+            .contains(&"rlm_helpers_add".to_string())
+        {
+            let rlm_helpers_handler: Arc<dyn crate::tools::registry::ToolHandler> =
+                Arc::new(RlmHelpersHandler);
+            builder.push_spec(create_rlm_helpers_add_tool());
+            builder.register_handler("rlm_helpers_add", Arc::clone(&rlm_helpers_handler));
+            builder.push_spec(create_rlm_helpers_list_tool());
+            builder.register_handler("rlm_helpers_list", Arc::clone(&rlm_helpers_handler));
+            builder.push_spec(create_rlm_helpers_remove_tool());
+            builder.register_handler("rlm_helpers_remove", rlm_helpers_handler);
+        }
+
+        if config
+            .experimental_supported_tools
+            .contains(&"rlm_memory_put".to_string())
+        {
+            let rlm_memory_handler = Arc::new(RlmMemoryHandler);
+            builder.push_spec(create_rlm_memory_put_tool());
+            builder.register_handler("rlm_memory_put", rlm_memory_handler);
+        }
+
+        if config
+            .experimental_supported_tools
+            .contains(&"rlm_memory_get".to_string())
+        {
+            let rlm_memory_handler = Arc::new(RlmMemoryHandler);
+            builder.push_spec(create_rlm_memory_get_tool());
+            builder.register_handler("rlm_memory_get", rlm_memory_handler);
+        }
+
+        if config
+            .experimental_supported_tools
+            .contains(&"rlm_memory_list".to_string())
+        {
+            let rlm_memory_handler = Arc::new(RlmMemoryHandler);
+            builder.push_spec(create_rlm_memory_list_tool());
+            builder.register_handler("rlm_memory_list", rlm_memory_handler);
+        }
+
+        if config
+            .experimental_supported_tools
+            .contains(&"rlm_memory_clear".to_string())
+        {
+            let rlm_memory_handler = Arc::new(RlmMemoryHandler);
+            builder.push_spec(create_rlm_memory_clear_tool());
+            builder.register_handler("rlm_memory_clear", rlm_memory_handler);
+        }
+
+        if config
+            .experimental_supported_tools
+            .contains(&"rlm_memory_batch".to_string())
+        {
+            let rlm_memory_handler = Arc::new(RlmMemoryHandler);
+            builder.push_spec(create_rlm_memory_batch_tool());
+            builder.register_handler("rlm_memory_batch", rlm_memory_handler);
+        }
+
+        if config
+            .experimental_supported_tools
+            .contains(&"rlm_query".to_string())
+        {
+            let rlm_query_handler = Arc::new(RlmQueryHandler);
+            builder.push_spec(create_rlm_query_tool());
+            builder.register_handler("rlm_query", rlm_query_handler);
+        }
     }
 
     match config.web_search_mode {
@@ -1382,6 +1870,10 @@ pub(crate) fn build_specs(
                 }
             }
         }
+    }
+
+    if let Some(allowlist) = &config.tool_allowlist {
+        builder.retain_allowed_tools(allowlist);
     }
 
     builder
@@ -1495,6 +1987,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(&config, None).build();
 
@@ -1559,6 +2053,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
         assert_contains_tool_names(
@@ -1577,6 +2073,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
         assert!(
@@ -1589,6 +2087,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
         assert_contains_tool_names(&tools, &["request_user_input"]);
@@ -1606,6 +2106,8 @@ mod tests {
             model_info: &model_info,
             features,
             web_search_mode,
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(&tools_config, Some(HashMap::new())).build();
         let tool_names = tools.iter().map(|t| t.spec.name()).collect::<Vec<_>>();
@@ -1622,6 +2124,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
 
@@ -1644,6 +2148,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
 
@@ -1890,6 +2396,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(&tools_config, Some(HashMap::new())).build();
 
@@ -1912,6 +2420,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
 
@@ -1931,6 +2441,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
 
@@ -1962,6 +2474,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(
             &tools_config,
@@ -2057,6 +2571,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
 
         // Intentionally construct a map with keys that would sort alphabetically.
@@ -2134,6 +2650,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
 
         let (tools, _) = build_specs(
@@ -2191,6 +2709,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
 
         let (tools, _) = build_specs(
@@ -2245,6 +2765,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
 
         let (tools, _) = build_specs(
@@ -2301,6 +2823,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
 
         let (tools, _) = build_specs(
@@ -2413,6 +2937,8 @@ Examples of valid command strings:
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            user_experimental_tools: &[],
+            tool_allowlist: None,
         });
         let (tools, _) = build_specs(
             &tools_config,

@@ -11,6 +11,7 @@ use crate::config::types::Notifications;
 use crate::config::types::OtelConfig;
 use crate::config::types::OtelConfigToml;
 use crate::config::types::OtelExporterKind;
+use crate::config::types::RlmConfigToml;
 use crate::config::types::SandboxWorkspaceWrite;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::config::types::ShellEnvironmentPolicyToml;
@@ -91,7 +92,48 @@ pub use codex_git::GhostSnapshotConfig;
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = None;
 
+/// RLM tool instructions injected when RLM tools are enabled.
+#[cfg(feature = "rlm")]
+const RLM_TOOL_INSTRUCTIONS: &str = r#"
+## RLM Tools (Large Context Processing)
+
+When RLM tools are available, use them for exploring large codebases or documents:
+
+- **rlm_load(path)**: Load file/directory context (resets session state)
+- **rlm_query(prompt)**: Fast read-only scan; prefer for quick questions
+- **rlm_exec(code)**: Python execution for structured extraction + multi-step analysis
+  - Builtins: `peek(start, end)`, `find(pattern)`, `search(query, k)`, `list_docs()`, `stats()`
+  - Set `result = {...}` for structured JSON return
+- **llm_query(prompt)**: Spawn sub-agent on a snippet (inside rlm_exec)
+
+Workflow: rlm_load → rlm_query (quick) or rlm_exec (complex) → iterate as needed.
+"#;
+
 pub const CONFIG_TOML_FILE: &str = "config.toml";
+
+/// Default RLM tools to enable when the RLM feature is compiled in.
+#[cfg(feature = "rlm")]
+pub(crate) fn default_rlm_tools() -> Vec<String> {
+    vec![
+        "rlm_load".to_string(),
+        "rlm_load_append".to_string(),
+        "rlm_exec".to_string(),
+        "rlm_query".to_string(),
+        "rlm_helpers_add".to_string(),
+        "rlm_helpers_list".to_string(),
+        "rlm_helpers_remove".to_string(),
+        "rlm_memory_put".to_string(),
+        "rlm_memory_get".to_string(),
+        "rlm_memory_list".to_string(),
+        "rlm_memory_clear".to_string(),
+        "rlm_memory_batch".to_string(),
+    ]
+}
+
+#[cfg(not(feature = "rlm"))]
+pub(crate) fn default_rlm_tools() -> Vec<String> {
+    Vec::new()
+}
 
 #[cfg(test)]
 pub(crate) fn test_config() -> Config {
@@ -304,6 +346,12 @@ pub struct Config {
     /// Explicit or feature-derived web search mode.
     pub web_search_mode: Option<WebSearchMode>,
 
+    /// User-configured experimental tools (e.g., ["rlm_load", "rlm_exec"]).
+    pub experimental_supported_tools: Vec<String>,
+
+    /// Optional allowlist that restricts tools to a specific set.
+    pub tool_allowlist: Option<Vec<String>>,
+
     /// If set to `true`, used only the experimental unified exec tool.
     pub use_experimental_unified_exec_tool: bool,
 
@@ -346,6 +394,9 @@ pub struct Config {
 
     /// OTEL configuration (exporter type, endpoint, headers, etc.).
     pub otel: crate::config::types::OtelConfig,
+
+    /// RLM runtime settings.
+    pub rlm: Option<RlmConfigToml>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -876,6 +927,10 @@ pub struct ConfigToml {
     /// Controls the web search tool mode: disabled, cached, or live.
     pub web_search: Option<WebSearchMode>,
 
+    /// User-configured experimental tools (e.g., ["rlm_load", "rlm_exec"]).
+    #[serde(default)]
+    pub experimental_supported_tools: Option<Vec<String>>,
+
     /// Nested tools section for feature toggles
     pub tools: Option<ToolsToml>,
 
@@ -884,6 +939,9 @@ pub struct ConfigToml {
 
     /// User-level skill config entries keyed by SKILL.md path.
     pub skills: Option<SkillsConfig>,
+
+    /// RLM runtime settings.
+    pub rlm: Option<RlmConfigToml>,
 
     /// Centralized feature flags (new). Prefer this over individual toggles.
     #[serde(default)]
@@ -1434,7 +1492,33 @@ impl Config {
         let file_base_instructions =
             Self::try_read_non_empty_file(model_instructions_path, "model instructions file")?;
         let base_instructions = base_instructions.or(file_base_instructions);
-        let developer_instructions = developer_instructions.or(cfg.developer_instructions);
+
+        // Compute experimental_supported_tools early so we can use it for RLM instructions
+        let experimental_supported_tools: Vec<String> = config_profile
+            .experimental_supported_tools
+            .clone()
+            .or(cfg.experimental_supported_tools.clone())
+            .unwrap_or_default();
+
+        // Append RLM instructions when RLM tools are enabled
+        #[cfg(feature = "rlm")]
+        let developer_instructions = {
+            let base = developer_instructions.or(cfg.developer_instructions.clone());
+            let has_rlm_tools = experimental_supported_tools
+                .iter()
+                .any(|t| t.starts_with("rlm_"));
+            if has_rlm_tools {
+                Some(match base {
+                    Some(existing) => format!("{existing}\n{RLM_TOOL_INSTRUCTIONS}"),
+                    None => RLM_TOOL_INSTRUCTIONS.to_string(),
+                })
+            } else {
+                base
+            }
+        };
+        #[cfg(not(feature = "rlm"))]
+        let developer_instructions = developer_instructions.or(cfg.developer_instructions.clone());
+
         let model_personality = model_personality
             .or(config_profile.model_personality)
             .or(cfg.model_personality);
@@ -1543,6 +1627,12 @@ impl Config {
             forced_login_method,
             include_apply_patch_tool: include_apply_patch_tool_flag,
             web_search_mode,
+            experimental_supported_tools: config_profile
+                .experimental_supported_tools
+                .clone()
+                .or(cfg.experimental_supported_tools.clone())
+                .unwrap_or_else(default_rlm_tools),
+            tool_allowlist: None,
             use_experimental_unified_exec_tool,
             ghost_snapshot,
             features,
@@ -1591,6 +1681,7 @@ impl Config {
                     metrics_exporter: OtelExporterKind::Statsig,
                 }
             },
+            rlm: cfg.rlm,
         };
         Ok(config)
     }
@@ -3696,6 +3787,8 @@ model_verbosity = "high"
                 forced_login_method: None,
                 include_apply_patch_tool: false,
                 web_search_mode: None,
+                experimental_supported_tools: Vec::new(),
+                tool_allowlist: None,
                 use_experimental_unified_exec_tool: false,
                 ghost_snapshot: GhostSnapshotConfig::default(),
                 features: Features::with_defaults(),
@@ -3713,6 +3806,7 @@ model_verbosity = "high"
                 feedback_enabled: true,
                 tui_alternate_screen: AltScreenMode::Auto,
                 otel: OtelConfig::default(),
+                rlm: None,
             },
             o3_profile_config
         );
@@ -3777,6 +3871,8 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             web_search_mode: None,
+            experimental_supported_tools: Vec::new(),
+            tool_allowlist: None,
             use_experimental_unified_exec_tool: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
@@ -3794,6 +3890,7 @@ model_verbosity = "high"
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
             otel: OtelConfig::default(),
+            rlm: None,
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -3873,6 +3970,8 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             web_search_mode: None,
+            experimental_supported_tools: Vec::new(),
+            tool_allowlist: None,
             use_experimental_unified_exec_tool: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
@@ -3890,6 +3989,7 @@ model_verbosity = "high"
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
             otel: OtelConfig::default(),
+            rlm: None,
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);
@@ -3955,6 +4055,8 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             web_search_mode: None,
+            experimental_supported_tools: Vec::new(),
+            tool_allowlist: None,
             use_experimental_unified_exec_tool: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
@@ -3972,6 +4074,7 @@ model_verbosity = "high"
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
             otel: OtelConfig::default(),
+            rlm: None,
         };
 
         assert_eq!(expected_gpt5_profile_config, gpt5_profile_config);

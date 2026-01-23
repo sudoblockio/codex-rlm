@@ -73,7 +73,7 @@ pub(crate) fn spawn_agent(
 /// Sends the provided `SessionConfiguredEvent` immediately, then forwards subsequent
 /// events and accepts Ops for submission.
 pub(crate) fn spawn_agent_from_existing(
-    thread: std::sync::Arc<CodexThread>,
+    thread: Arc<CodexThread>,
     session_configured: codex_core::protocol::SessionConfiguredEvent,
     app_event_tx: AppEventSender,
 ) -> UnboundedSender<Op> {

@@ -140,6 +140,8 @@ use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
+#[cfg(feature = "rlm")]
+use crate::rlm_session::RlmSession;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
@@ -540,6 +542,17 @@ impl Session {
         per_turn_config
     }
 
+    #[cfg(feature = "rlm")]
+    pub(crate) async fn rlm_session(&self) -> anyhow::Result<Arc<Mutex<RlmSession>>> {
+        let mut state = self.state.lock().await;
+        if let Some(session) = state.rlm_session.as_ref() {
+            return Ok(Arc::clone(session));
+        }
+        let session = Arc::new(Mutex::new(RlmSession::new()?));
+        state.rlm_session = Some(Arc::clone(&session));
+        Ok(session)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn make_turn_context(
         auth_manager: Option<Arc<AuthManager>>,
@@ -572,6 +585,8 @@ impl Session {
             model_info: &model_info,
             features: &per_turn_config.features,
             web_search_mode: per_turn_config.web_search_mode,
+            user_experimental_tools: &per_turn_config.experimental_supported_tools,
+            tool_allowlist: per_turn_config.tool_allowlist.as_deref(),
         });
 
         TurnContext {
@@ -2740,6 +2755,8 @@ async fn spawn_review_thread(
         model_info: &review_model_info,
         features: &review_features,
         web_search_mode: Some(review_web_search_mode),
+        user_experimental_tools: &[],
+        tool_allowlist: None,
     });
 
     let review_prompt = resolved.prompt.clone();

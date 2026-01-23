@@ -7,6 +7,20 @@ mod mcp_resource;
 mod plan;
 mod read_file;
 mod request_user_input;
+#[cfg(feature = "rlm")]
+mod rlm_exec;
+#[cfg(feature = "rlm")]
+mod rlm_helpers;
+#[cfg(feature = "rlm")]
+mod rlm_load;
+#[cfg(feature = "rlm")]
+mod rlm_load_append;
+#[cfg(feature = "rlm")]
+mod rlm_memory;
+#[cfg(feature = "rlm")]
+mod rlm_query;
+#[cfg(feature = "rlm")]
+mod rlm_types;
 mod shell;
 mod test_sync;
 mod unified_exec;
@@ -25,6 +39,18 @@ pub use mcp_resource::McpResourceHandler;
 pub use plan::PlanHandler;
 pub use read_file::ReadFileHandler;
 pub use request_user_input::RequestUserInputHandler;
+#[cfg(feature = "rlm")]
+pub(crate) use rlm_exec::RlmExecHandler;
+#[cfg(feature = "rlm")]
+pub(crate) use rlm_helpers::RlmHelpersHandler;
+#[cfg(feature = "rlm")]
+pub(crate) use rlm_load::RlmLoadHandler;
+#[cfg(feature = "rlm")]
+pub(crate) use rlm_load_append::RlmLoadAppendHandler;
+#[cfg(feature = "rlm")]
+pub(crate) use rlm_memory::RlmMemoryHandler;
+#[cfg(feature = "rlm")]
+pub(crate) use rlm_query::RlmQueryHandler;
 pub use shell::ShellCommandHandler;
 pub use shell::ShellHandler;
 pub use test_sync::TestSyncHandler;

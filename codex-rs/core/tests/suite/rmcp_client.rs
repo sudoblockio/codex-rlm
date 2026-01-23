@@ -39,10 +39,24 @@ use tokio::time::sleep;
 
 static OPENAI_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAD0AAAA9CAYAAAAeYmHpAAAE6klEQVR4Aeyau44UVxCGx1fZsmRLlm3Zoe0XcGQ5cUiCCIgJeS9CHgAhMkISQnIuGQgJEkBcxLW+nqnZ6uqqc+nuWRC7q/P3qetf9e+MtOwyX25O4Nep6JPyop++0qev9HrfgZ+F6r2DuB/vHOrt/UIkqdDHYvujOW6fO7h/CNEI+a5jc+pBR8uy0jVFsziYu5HtfSUk+Io34q921hLNctFSX0gwww+S8wce8K1LfCU+cYW4888aov8NxqvQILUPPReLOrm6zyLxa4i+6VZuFbJo8d1MOHZm+7VUtB/aIvhPWc/3SWg49JcwFLlHxuXKjtyloo+YNhuW3VS+WPBuUEMvCFKjEDVgFBQHXrnazpqiSxNZCkQ1kYiozsbm9Oz7l4i2Il7vGccGNWAc3XosDrZe/9P3ZnMmzHNEQw4smf8RQ87XEAMsC7Az0Au+dgXerfH4+sHvEc0SYGic8WBBUGqFH2gN7yDrazy7m2pbRTeRmU3+MjZmr1h6LJgPbGy23SI6GlYT0brQ71IY8Us4PNQCm+zepSbaD2BY9xCaAsD9IIj/IzFmKMSdHHonwdZATbTnYREf6/VZGER98N9yCWIvXQwXDoDdhZJoT8jwLnJXDB9w4Sb3e6nK5ndzlkTLnP3JBu4LKkbrYrU69gCVceV0JvpyuW1xlsUVngzhwMetn/XamtTORF9IO5YnWNiyeF9zCAfqR3fUW+vZZKLtgP+ts8BmQRBREAdRDhH3o8QuRh/YucNFz2BEjxbRN6LGzphfKmvP6v6QhqIQyZ8XNJ0W0X83MR1PEcJBNO2KC2Z1TW/v244scp9FwRViZxIOBF0Lctk7ZVSavdLvRlV1hz/ysUi9sr8CIcB3nvWBwA93ykTz18eAYxQ6N/K2DkPA1lv3iXCwmDUT7YkjIby9siXueIJj9H+pzSqJ9oIuJWTUgSSt4WO7o/9GGg0viR4VinNRUDoIj34xoCd6pxD3aK3zfdbnx5v1J3ZNNEJsE0sBG7N27ReDrJc4sFxz7dI/ZAbOmmiKvHBitQXpAdR6+F7v+/ol/tOouUV01EeMZQF2BoQDn6dP4XNr+j9GZEtEK1/L8pFw7bd3a53tsTa7WD+054jOFmPg1XBKPQgnqFfmFcy32ZRvjmiIIQTYFvyDxQ8nH8WIwwGwlyDjDznnilYyFr6njrlZwsKkBpO59A7OwgdzPEWRm+G+oeb7IfyNuzjEEVLrOVxJsxvxwF8kmCM6I2QYmJunz4u4TrADpfl7mlbRTWQ7VmrBzh3+C9f6Grc3YoGN9dg/SXFthpRsT6vobfXRs2VBlgBHXVMLHjDNbIZv1sZ9+X3hB09cXdH1JKViyG0+W9bWZDa/r2f9zAFR71sTzGpMSWz2iI4YssWjWo3REy1MDGjdwe5e0dFSiAC1JakBvu4/CUS8Eh6dqHdU0Or0ioY3W5ClSqDXAy7/6SRfgw8vt4I+tbvvNtFT2kVDhY5+IGb1rCqYaXNF08vSALsXCPmt0kQNqJT1p5eI1mkIV/BxCY1z85lOzeFbPBQHURkkPTlwTYK9gTVE25l84IbFFN+YJDHjdpn0gq6mrHht0dkcjbM4UL9283O5p77GN+SPW/QwVB4IUYg7Or+Kp7naR6qktP98LNF2UxWo9yObPIT9KYg+hK4i56no4rfnM0qeyFf6AwAAAP//trwR3wAAAAZJREFUAwBZ0sR75itw5gAAAABJRU5ErkJggg==";
 
+fn stdio_server_bin_or_skip() -> Option<String> {
+    match stdio_server_bin() {
+        Ok(path) => Some(path),
+        Err(err) => {
+            eprintln!("test_stdio_server binary not available, skipping test: {err}");
+            None
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_test_value)]
 async fn stdio_server_round_trip() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
+
+    let Some(rmcp_test_server_bin) = stdio_server_bin_or_skip() else {
+        return Ok(());
+    };
 
     let server = responses::start_mock_server().await;
 
@@ -69,8 +83,6 @@ async fn stdio_server_round_trip() -> anyhow::Result<()> {
     .await;
 
     let expected_env_value = "propagated-env";
-    let rmcp_test_server_bin = stdio_server_bin()?;
-
     let fixture = test_codex()
         .with_config(move |config| {
             let mut servers = config.mcp_servers.get().clone();
@@ -182,6 +194,10 @@ async fn stdio_server_round_trip() -> anyhow::Result<()> {
 async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
+    let Some(rmcp_test_server_bin) = stdio_server_bin_or_skip() else {
+        return Ok(());
+    };
+
     let server = responses::start_mock_server().await;
 
     let call_id = "img-1";
@@ -209,8 +225,6 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
     .await;
 
     // Build the stdio rmcp server and pass the image as data URL so it can construct ImageContent.
-    let rmcp_test_server_bin = stdio_server_bin()?;
-
     let fixture = test_codex()
         .with_config(move |config| {
             let mut servers = config.mcp_servers.get().clone();
@@ -337,6 +351,10 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
 async fn stdio_image_completions_round_trip() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
+    let Some(rmcp_test_server_bin) = stdio_server_bin_or_skip() else {
+        return Ok(());
+    };
+
     let server = responses::start_mock_server().await;
 
     let call_id = "img-cc-1";
@@ -405,8 +423,6 @@ async fn stdio_image_completions_round_trip() -> anyhow::Result<()> {
         .expect(2)
         .mount(&server)
         .await;
-
-    let rmcp_test_server_bin = stdio_server_bin()?;
 
     let fixture = test_codex()
         .with_config(move |config| {
@@ -530,6 +546,10 @@ async fn stdio_image_completions_round_trip() -> anyhow::Result<()> {
 async fn stdio_server_propagates_whitelisted_env_vars() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
+    let Some(rmcp_test_server_bin) = stdio_server_bin_or_skip() else {
+        return Ok(());
+    };
+
     let server = responses::start_mock_server().await;
 
     let call_id = "call-1234";
@@ -556,8 +576,6 @@ async fn stdio_server_propagates_whitelisted_env_vars() -> anyhow::Result<()> {
 
     let expected_env_value = "propagated-env-from-whitelist";
     let _guard = EnvVarGuard::set("MCP_TEST_VALUE", OsStr::new(expected_env_value));
-    let rmcp_test_server_bin = stdio_server_bin()?;
-
     let fixture = test_codex()
         .with_config(move |config| {
             let mut servers = config.mcp_servers.get().clone();

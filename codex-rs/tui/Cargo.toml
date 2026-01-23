@@ -13,10 +13,13 @@ name = "codex_tui"
 path = "src/lib.rs"
 
 [features]
+default = ["rlm"]
 # Enable vt100-based tests (emulator) when running with `--features vt100-tests`.
 vt100-tests = []
 # Gate verbose debug logging inside the TUI implementation.
 debug-logs = []
+# Enable RLM tool support
+rlm = ["codex-core/rlm"]
 
 [lints]
 workspace = true
@@ -41,6 +44,7 @@ codex-file-search = { workspace = true }
 codex-login = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
+codex-rlm = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 color-eyre = { workspace = true }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }

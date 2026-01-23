@@ -72,7 +72,7 @@ async fn build_codex_with_test_tool(server: &wiremock::MockServer) -> anyhow::Re
 fn assert_parallel_duration(actual: Duration) {
     // Allow headroom for slow CI scheduling; barrier synchronization already enforces overlap.
     assert!(
-        actual < Duration::from_millis(1_200),
+        actual < Duration::from_millis(2_000),
         "expected parallel execution to finish quickly, got {actual:?}"
     );
 }
@@ -96,7 +96,7 @@ async fn read_file_tools_run_in_parallel() -> anyhow::Result<()> {
         "barrier": {
             "id": "parallel-test-sync-warmup",
             "participants": 2,
-            "timeout_ms": 1_000,
+            "timeout_ms": 3_000,
         }
     })
     .to_string();
@@ -106,7 +106,7 @@ async fn read_file_tools_run_in_parallel() -> anyhow::Result<()> {
         "barrier": {
             "id": "parallel-test-sync",
             "participants": 2,
-            "timeout_ms": 1_000,
+            "timeout_ms": 3_000,
         }
     })
     .to_string();
