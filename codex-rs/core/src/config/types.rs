@@ -383,6 +383,46 @@ pub struct OtelConfigToml {
     pub trace_exporter: Option<OtelExporterKind>,
 }
 
+// ===== RLM configuration =====
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RlmConfigToml {
+    /// Optional gateway configuration for the RLM runtime.
+    pub gateway: Option<RlmGatewayConfigToml>,
+
+    /// Optional prompt template overrides for the RLM runtime.
+    pub prompt: Option<RlmPromptConfigToml>,
+
+    /// Optional sub-agent policy overrides for RLM tool calls.
+    pub sub_agent_policy: Option<RlmSubAgentPolicyToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RlmGatewayConfigToml {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub api_key: Option<String>,
+    pub wire_api: Option<String>,
+    pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RlmPromptConfigToml {
+    pub template: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RlmSubAgentPolicyToml {
+    pub allowed_tool_overrides: Option<Vec<String>>,
+    pub require_approval: Option<bool>,
+}
+
 /// Effective OTEL settings after defaults are applied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OtelConfig {

@@ -12,6 +12,7 @@ use crate::config::types::OtelConfig;
 use crate::config::types::OtelConfigToml;
 use crate::config::types::OtelExporterKind;
 use crate::config::types::Personality;
+use crate::config::types::RlmConfigToml;
 use crate::config::types::SandboxWorkspaceWrite;
 use crate::config::types::ScrollInputMode;
 use crate::config::types::ShellEnvironmentPolicy;
@@ -353,6 +354,12 @@ pub struct Config {
     /// Explicit or feature-derived web search mode.
     pub web_search_mode: Option<WebSearchMode>,
 
+    /// User-configured experimental tools (e.g., ["rlm_load", "rlm_exec"]).
+    pub experimental_supported_tools: Vec<String>,
+
+    /// Optional allowlist that restricts tools to a specific set.
+    pub tool_allowlist: Option<Vec<String>>,
+
     /// If set to `true`, used only the experimental unified exec tool.
     pub use_experimental_unified_exec_tool: bool,
 
@@ -395,6 +402,9 @@ pub struct Config {
 
     /// OTEL configuration (exporter type, endpoint, headers, etc.).
     pub otel: crate::config::types::OtelConfig,
+
+    /// RLM runtime settings.
+    pub rlm: Option<RlmConfigToml>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -925,6 +935,10 @@ pub struct ConfigToml {
     /// Controls the web search tool mode: disabled, cached, or live.
     pub web_search: Option<WebSearchMode>,
 
+    /// User-configured experimental tools (e.g., ["rlm_load", "rlm_exec"]).
+    #[serde(default)]
+    pub experimental_supported_tools: Option<Vec<String>>,
+
     /// Nested tools section for feature toggles
     pub tools: Option<ToolsToml>,
 
@@ -933,6 +947,9 @@ pub struct ConfigToml {
 
     /// User-level skill config entries keyed by SKILL.md path.
     pub skills: Option<SkillsConfig>,
+
+    /// RLM runtime settings.
+    pub rlm: Option<RlmConfigToml>,
 
     /// Centralized feature flags (new). Prefer this over individual toggles.
     #[serde(default)]
@@ -1587,6 +1604,12 @@ impl Config {
             forced_login_method,
             include_apply_patch_tool: include_apply_patch_tool_flag,
             web_search_mode,
+            experimental_supported_tools: config_profile
+                .experimental_supported_tools
+                .clone()
+                .or(cfg.experimental_supported_tools.clone())
+                .unwrap_or_default(),
+            tool_allowlist: None,
             use_experimental_unified_exec_tool,
             ghost_snapshot,
             features,
@@ -1655,6 +1678,7 @@ impl Config {
                     metrics_exporter: OtelExporterKind::Statsig,
                 }
             },
+            rlm: cfg.rlm,
         };
         Ok(config)
     }
@@ -3768,6 +3792,8 @@ model_verbosity = "high"
                 forced_login_method: None,
                 include_apply_patch_tool: false,
                 web_search_mode: None,
+                experimental_supported_tools: Vec::new(),
+                tool_allowlist: None,
                 use_experimental_unified_exec_tool: false,
                 ghost_snapshot: GhostSnapshotConfig::default(),
                 features: Features::with_defaults(),
@@ -3793,6 +3819,7 @@ model_verbosity = "high"
                 tui_scroll_invert: false,
                 tui_alternate_screen: AltScreenMode::Auto,
                 otel: OtelConfig::default(),
+                rlm: None,
             },
             o3_profile_config
         );
@@ -3857,6 +3884,8 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             web_search_mode: None,
+            experimental_supported_tools: Vec::new(),
+            tool_allowlist: None,
             use_experimental_unified_exec_tool: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
@@ -3882,6 +3911,7 @@ model_verbosity = "high"
             tui_scroll_invert: false,
             tui_alternate_screen: AltScreenMode::Auto,
             otel: OtelConfig::default(),
+            rlm: None,
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -3961,6 +3991,8 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             web_search_mode: None,
+            experimental_supported_tools: Vec::new(),
+            tool_allowlist: None,
             use_experimental_unified_exec_tool: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
@@ -3986,6 +4018,7 @@ model_verbosity = "high"
             tui_scroll_invert: false,
             tui_alternate_screen: AltScreenMode::Auto,
             otel: OtelConfig::default(),
+            rlm: None,
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);
@@ -4051,6 +4084,8 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             web_search_mode: None,
+            experimental_supported_tools: Vec::new(),
+            tool_allowlist: None,
             use_experimental_unified_exec_tool: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
@@ -4076,6 +4111,7 @@ model_verbosity = "high"
             tui_scroll_invert: false,
             tui_alternate_screen: AltScreenMode::Auto,
             otel: OtelConfig::default(),
+            rlm: None,
         };
 
         assert_eq!(expected_gpt5_profile_config, gpt5_profile_config);

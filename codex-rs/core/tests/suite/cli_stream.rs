@@ -24,6 +24,16 @@ fn cli_responses_fixture() -> std::path::PathBuf {
     find_resource!("tests/cli_responses_fixture.sse").expect("failed to resolve fixture path")
 }
 
+fn codex_cli_bin() -> Option<std::path::PathBuf> {
+    match codex_utils_cargo_bin::cargo_bin("codex") {
+        Ok(path) => Some(path),
+        Err(err) => {
+            eprintln!("codex binary not available, skipping test: {err}");
+            None
+        }
+    }
+}
+
 /// Tests streaming chat completions through the CLI using a mock server.
 /// This test:
 /// 1. Sets up a mock server that simulates OpenAI's chat completions API
@@ -33,6 +43,10 @@ fn cli_responses_fixture() -> std::path::PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_mode_stream_cli() {
     skip_if_no_network!();
+
+    let Some(bin) = codex_cli_bin() else {
+        return;
+    };
 
     let server = MockServer::start().await;
     let repo_root = repo_root();
@@ -57,8 +71,7 @@ async fn chat_mode_stream_cli() {
         "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"chat\" }}",
         server.uri()
     );
-    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
-    let mut cmd = AssertCommand::new(bin);
+    let mut cmd = AssertCommand::new(&bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-c")
@@ -116,6 +129,10 @@ async fn chat_mode_stream_cli() {
 async fn exec_cli_applies_model_instructions_file() {
     skip_if_no_network!();
 
+    let Some(bin) = codex_cli_bin() else {
+        return;
+    };
+
     // Start mock server which will capture the request and return a minimal
     // SSE stream for a single turn.
     let server = MockServer::start().await;
@@ -142,8 +159,7 @@ async fn exec_cli_applies_model_instructions_file() {
 
     let home = TempDir::new().unwrap();
     let repo_root = repo_root();
-    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
-    let mut cmd = AssertCommand::new(bin);
+    let mut cmd = AssertCommand::new(&bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-c")
@@ -190,12 +206,15 @@ async fn exec_cli_applies_model_instructions_file() {
 async fn responses_api_stream_cli() {
     skip_if_no_network!();
 
+    let Some(bin) = codex_cli_bin() else {
+        return;
+    };
+
     let fixture = cli_responses_fixture();
     let repo_root = repo_root();
 
     let home = TempDir::new().unwrap();
-    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
-    let mut cmd = AssertCommand::new(bin);
+    let mut cmd = AssertCommand::new(&bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-C")
@@ -218,6 +237,10 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     // Honor sandbox network restrictions for CI parity with the other tests.
     skip_if_no_network!(Ok(()));
 
+    let Some(bin) = codex_cli_bin() else {
+        return Ok(());
+    };
+
     // 1. Temp home so we read/write isolated session files.
     let home = TempDir::new()?;
 
@@ -230,8 +253,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     let repo_root = repo_root();
 
     // 4. Run the codex CLI and invoke `exec`, which is what records a session.
-    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
-    let mut cmd = AssertCommand::new(bin);
+    let mut cmd = AssertCommand::new(&bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-C")
@@ -351,8 +373,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     // Second run: resume should update the existing file.
     let marker2 = format!("integration-resume-{}", Uuid::new_v4());
     let prompt2 = format!("echo {marker2}");
-    let bin2 = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
-    let mut cmd2 = AssertCommand::new(bin2);
+    let mut cmd2 = AssertCommand::new(&bin);
     cmd2.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-C")

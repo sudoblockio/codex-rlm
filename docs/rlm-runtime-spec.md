@@ -893,18 +893,18 @@ See `codex-rs/rlm/INTEGRATION_PLAN.md` for detailed implementation phases and ch
 
 **Summary:**
 - ✅ PythonRuntime with PyO3
-- ✅ Core builtins (peek, find, stats, llm_query)
-- ✅ Context loading (file, directory, DocTree)
+- ✅ Core builtins (peek, find, stats, limits, llm_query)
+- ⚠️ Context loading (file, directory, DocTree) — DocTree currently markdown-only
 - ✅ AGENTS.md routing
 - ✅ AST security validation
-- ⚠️ Structured output (partial)
-- ❌ `result_json` + `result_meta` return channels
-- ❌ `rlm_load_append`
-- ❌ `rlm_query` convenience tool
-- ❌ `session()` manifest builtin
-- ❌ `limits()` builtin
-- ❌ Per-call limit overrides
-- ❌ Helpers with insertion-order injection
-- ❌ Memory with batch operations
-- ❌ Budget tracking integration
-- ❌ Sub-agent tool override with audit logging
+- ✅ Structured output (result_json/result_meta/warnings/tool_override_events)
+- ✅ `rlm_load_append`
+- ✅ `rlm_query` convenience tool
+- ✅ `session()` manifest builtin
+- ✅ `limits()` builtin
+- ✅ Per-call limit overrides
+- ✅ Helpers with insertion-order injection
+- ✅ Memory with batch operations
+- ✅ Budget tracking integration (sub_calls/tokens/time decremented; tokens estimated from prompts)
+- ✅ Sub-agent tool override policy + audit logging
+- ⚠️ `llm_query_batch` runs sequentially (no parallel fan-out yet)
