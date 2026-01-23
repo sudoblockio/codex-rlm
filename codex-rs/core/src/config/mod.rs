@@ -106,6 +106,9 @@ When RLM tools are available, use them for exploring large codebases or document
   - Builtins: `list_docs()`, `peek_doc(doc_id, start, end)`, `find(pattern)`, `search(query, k)`, `stats()`
   - Use `peek_doc(doc_id)` to read specific files—avoids boundary confusion with multi-file contexts
   - `find()` returns `{"matches": [...], "capped": bool}`—check `capped` for truncation
+  - `stats()` includes `broken_links` if routing entries point to missing files
+  - `routing_coverage()` shows loaded vs missing linked docs with coverage percentage
+  - `files_accessed()` returns list of docs read during execution (for verification)
   - Set `result = {...}` for structured JSON return
 - **llm_query(prompt)**: Spawn sub-agent on a snippet (inside rlm_exec)
 
@@ -115,8 +118,9 @@ Tips:
 - Each document includes a `source` field showing which load it came from
 - Check `exclusions` in rlm_load stats to see why files were skipped (binary, oversized, symlinks, limits)
 - Symlinks to directories are NOT followed (to avoid cycles); symlinks to files are included
+- Call `stats()` after loading to detect broken routing links early
 
-Workflow: rlm_load → rlm_query (quick) or rlm_exec (complex) → iterate as needed.
+Workflow: rlm_load → stats() (check broken_links) → rlm_query (quick) or rlm_exec (complex) → iterate.
 "#;
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
