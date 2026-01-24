@@ -64,7 +64,6 @@ pyenv global 3.11.0
 ```bash
 git clone https://github.com/openai/codex.git
 cd codex/codex-rs
-git checkout feat/rlm-runtime
 ```
 
 ### 2. Build
@@ -177,15 +176,6 @@ sudo dnf install python3.11-devel
 
 ```bash
 PYTHON_CONFIGURE_OPTS="--enable-shared" pyenv install 3.11.0
-```
-
-### `error: the package 'codex-tui' does not contain this feature: rlm`
-
-Make sure you're on the correct branch:
-
-```bash
-git checkout feat/rlm-runtime
-git pull origin feat/rlm-runtime
 ```
 
 ### RLM tools not appearing in session
