@@ -97,30 +97,45 @@ pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = None;
 const RLM_TOOL_INSTRUCTIONS: &str = r#"
 ## RLM Tools (Large Context Processing)
 
-When RLM tools are available, use them for exploring large codebases or documents:
+**IMPORTANT: After rlm_load, call `help()` in rlm_exec to see all available builtins.**
 
-- **rlm_load(path)**: Load file/directory context (resets session state)
-- **rlm_load_append(path)**: Add additional context (preserves state)
-- **rlm_query(prompt)**: Fast read-only scan; prefer for quick questions
-- **rlm_exec(code)**: Python execution for structured extraction + multi-step analysis
-  - Builtins: `list_docs()`, `peek_doc(doc_id, start, end)`, `find(pattern)`, `search(query, k)`, `stats()`
-  - Use `peek_doc(doc_id)` to read specific files—avoids boundary confusion with multi-file contexts
-  - `find()` returns `{"matches": [...], "capped": bool}`—check `capped` for truncation
-  - `stats()` includes `broken_links` if routing entries point to missing files
-  - `routing_coverage()` shows loaded vs missing linked docs with coverage percentage
-  - `files_accessed()` returns list of docs read during execution (for verification)
-  - Set `result = {...}` for structured JSON return
-- **llm_query(prompt)**: Spawn sub-agent on a snippet (inside rlm_exec)
+### Tools
+- **rlm_load(path)**: Load file/directory into context (resets state)
+- **rlm_load_append(path)**: Add more files (preserves state)
+- **rlm_query(prompt)**: Quick read-only question about the context
+- **rlm_exec(code)**: Python execution with builtins (see below)
 
-Tips:
-- Use `list_docs()` to see available files with their IDs and byte ranges
-- For appended sources (rlm_load_append), doc IDs are prefixed with source index (e.g., "1:path/file.txt")
-- Each document includes a `source` field showing which load it came from
-- Check `exclusions` in rlm_load stats to see why files were skipped (binary, oversized, symlinks, limits)
-- Symlinks to directories are NOT followed (to avoid cycles); symlinks to files are included
-- Call `stats()` after loading to detect broken routing links early
+### Key Builtins (inside rlm_exec)
 
-Workflow: rlm_load → stats() (check broken_links) → rlm_query (quick) or rlm_exec (complex) → iterate.
+**Discovery:**
+- `help()` — List all builtins with usage
+- `count_docs(prefix)` — Count docs matching prefix (fast, use first!)
+- `list_docs(prefix)` — List docs → `{docs, total, truncated}` (USE prefix on large repos!)
+- `stats()` — Context stats + `broken_links` for invalid routing
+
+**Reading files (use peek_doc, NOT raw peek):**
+- `peek_doc(doc_id)` — Read file by ID (from list_docs or search results)
+- `peek_doc(doc_id, start, end)` — Read slice within a file
+
+**Searching:**
+- `find(pattern)` — Regex search → `{matches: [{start, end, id}...], capped}`
+- `search(query, k)` — BM25 semantic → `[{text, score, start, end, id}...]`
+
+Both return `id` (same as list_docs) so you can call `peek_doc(result["id"])` on results.
+
+**Routing:**
+- `routing_coverage()` — `{loaded, missing, coverage_pct}` for navigation links
+- `find_routes(topic)` — Find AGENTS.md entries matching topic
+
+### Workflow
+```
+rlm_load("/path") → rlm_exec("print(help())") → rlm_exec("stats()") → search/find → peek_doc
+```
+
+### Common Mistakes
+- DON'T use raw `peek(start, end)` — offsets are confusing; use `peek_doc(doc_id)` instead
+- DON'T grep manually — use `find(pattern)` or `search(query)` which return doc_id
+- DO check `stats()["broken_links"]` after load to detect invalid routing paths
 "#;
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";

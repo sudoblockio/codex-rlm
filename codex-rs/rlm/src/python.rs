@@ -491,6 +491,109 @@ impl PythonRuntime {
 import re
 
 
+def help(topic=None):
+    """Show available RLM builtins and usage.
+
+    Args:
+        topic: Optional builtin name for detailed help (e.g., help("peek_doc"))
+
+    Returns:
+        str: Help text
+    """
+    builtins_info = {
+        "list_docs": {
+            "sig": "list_docs(prefix='', limit=100, offset=0)",
+            "desc": "List docs → {docs: [...], total, truncated}",
+            "tip": "USE prefix='_platform/' on large repos to avoid timeout!",
+        },
+        "count_docs": {
+            "sig": "count_docs(prefix='')",
+            "desc": "Count docs matching prefix (fast)",
+            "tip": "Use before list_docs to check size: count_docs('_platform/')",
+        },
+        "peek_doc": {
+            "sig": "peek_doc(doc_id, start=0, end=None)",
+            "desc": "Read a document by ID (preferred over raw peek)",
+            "tip": "Get doc_id from list_docs() or search/find results",
+        },
+        "get_doc": {
+            "sig": "get_doc(doc_id)",
+            "desc": "Get document metadata {id, path, size, start, end}",
+            "tip": "Use to debug/verify document offsets before peek_doc",
+        },
+        "peek": {
+            "sig": "peek(start, end)",
+            "desc": "Read raw bytes from concatenated context (use peek_doc instead)",
+            "tip": "Prefer peek_doc(doc_id) to avoid offset confusion",
+        },
+        "find": {
+            "sig": "find(pattern, flags=None)",
+            "desc": "Regex search - returns {matches: [{start, end, id}...], capped: bool}",
+            "tip": "Use for exact pattern matching; use result['id'] with peek_doc()",
+        },
+        "search": {
+            "sig": "search(query, k=10)",
+            "desc": "BM25 semantic search - returns [{text, score, start, end, id}...]",
+            "tip": "Use for natural language queries; use result['id'] with peek_doc()",
+        },
+        "stats": {
+            "sig": "stats()",
+            "desc": "Context stats: chars, lines, docs, sources, broken_links",
+            "tip": "Check broken_links after load to detect invalid routing paths",
+        },
+        "routing_coverage": {
+            "sig": "routing_coverage()",
+            "desc": "Show which routing links are loaded vs missing",
+            "tip": "Returns {total_links, loaded, missing, coverage_pct}",
+        },
+        "find_routes": {
+            "sig": "find_routes(topic, limit=10)",
+            "desc": "Find AGENTS.md routing entries matching a topic",
+            "tip": "Only returns routes with valid paths by default",
+        },
+        "files_accessed": {
+            "sig": "files_accessed()",
+            "desc": "List documents read during this execution",
+            "tip": "Call at end of exec to verify what was actually read",
+        },
+        "llm_query": {
+            "sig": "llm_query(prompt)",
+            "desc": "Spawn sub-agent to process a snippet",
+            "tip": "Use for complex analysis that needs LLM reasoning",
+        },
+    }
+
+    if topic:
+        topic = topic.lower().replace("()", "")
+        if topic in builtins_info:
+            info = builtins_info[topic]
+            return f"{info['sig']}\n  {info['desc']}\n  Tip: {info['tip']}"
+        return f"Unknown builtin: {topic}. Call help() for list."
+
+    lines = ["RLM Builtins (call help('name') for details):", ""]
+    lines.append("Discovery:")
+    lines.append(f"  count_docs(pfx)  - {builtins_info['count_docs']['desc']}")
+    lines.append(f"  list_docs(pfx)   - {builtins_info['list_docs']['desc']}")
+    lines.append(f"  stats()          - {builtins_info['stats']['desc']}")
+    lines.append("")
+    lines.append("Reading (use peek_doc, not peek):")
+    lines.append(f"  peek_doc(id)     - {builtins_info['peek_doc']['desc']}")
+    lines.append(f"  peek(start,end)  - {builtins_info['peek']['desc']}")
+    lines.append("")
+    lines.append("Searching:")
+    lines.append(f"  find(pattern)    - {builtins_info['find']['desc']}")
+    lines.append(f"  search(query)    - {builtins_info['search']['desc']}")
+    lines.append("")
+    lines.append("Routing:")
+    lines.append(f"  find_routes(t)   - {builtins_info['find_routes']['desc']}")
+    lines.append(f"  routing_coverage() - {builtins_info['routing_coverage']['desc']}")
+    lines.append("")
+    lines.append("Advanced:")
+    lines.append(f"  llm_query(p)     - {builtins_info['llm_query']['desc']}")
+    lines.append(f"  files_accessed() - {builtins_info['files_accessed']['desc']}")
+    return "\n".join(lines)
+
+
 def _parse_flags(flags):
     if not flags:
         return 0
@@ -556,6 +659,22 @@ def peek(start, end):
     return P[start:end]
 
 
+def get_doc(doc_id):
+    """Get document metadata by ID (for debugging).
+
+    Args:
+        doc_id: Document ID from list_docs()
+
+    Returns:
+        dict with id, path, size, start, end or None if not found
+    """
+    data = _state.get("document_list_json")
+    if not data:
+        return None
+    docs = json.loads(data)
+    return next((d for d in docs if d.get("id") == doc_id), None)
+
+
 def peek_doc(doc_id, start=0, end=None):
     """Peek within a specific document's bounds.
 
@@ -568,18 +687,22 @@ def peek_doc(doc_id, start=0, end=None):
         end: End offset within the document (default: document size)
 
     Returns:
-        str: The requested slice, or empty string if doc not found
+        str: The requested slice, or error message if doc not found
 
     Note: Returns a copy (Python string slice semantics).
     """
     data = _state.get("document_list_json")
     if not data:
-        return ""
+        return "[error: no documents loaded]"
 
     docs = json.loads(data)
     doc = next((d for d in docs if d.get("id") == doc_id), None)
     if not doc:
-        return ""
+        # Try to find similar IDs for helpful error
+        similar = [d.get("id") for d in docs if doc_id in d.get("id", "")][:3]
+        if similar:
+            return f"[error: doc '{doc_id}' not found. Similar: {similar}]"
+        return f"[error: doc '{doc_id}' not found]"
 
     doc_start = doc.get("start", 0)
     doc_size = doc.get("size", 0)
@@ -607,7 +730,7 @@ def find(pattern, flags=None):
 
     Returns:
         dict with keys:
-            matches: list of (start, end) tuples
+            matches: list of {start, end, id} dicts (id = doc_id for peek_doc)
             capped: bool, True if results were truncated at limit
     """
     compiled = re.compile(pattern, _parse_flags(flags))
@@ -615,7 +738,12 @@ def find(pattern, flags=None):
     matches = []
     capped = False
     for match in compiled.finditer(P):
-        matches.append((match.start(), match.end()))
+        doc_id = _find_doc_at_offset(match.start())
+        matches.append({
+            "start": match.start(),
+            "end": match.end(),
+            "id": doc_id,
+        })
         if limit > 0 and len(matches) >= limit:
             capped = True
             _state["find_results_capped"] = True
@@ -884,13 +1012,17 @@ def search(query, k=10):
         k: Maximum number of results (default 10)
 
     Returns:
-        List of dicts with keys: text, score, start, end
+        List of dicts with keys: text, score, start, end, id (id = doc_id for peek_doc)
     """
     handler = _state.get("search_handler")
     if handler is None:
         raise RuntimeError("search is not configured - context may not be loaded")
     results_json = handler.search(query, k)
-    return json.loads(results_json)
+    results = json.loads(results_json)
+    # Add id (doc_id) to each result for use with peek_doc
+    for r in results:
+        r["id"] = _find_doc_at_offset(r.get("start", 0))
+    return results
 
 
 def find_routes(topic, limit=10, validate_paths=True):
@@ -975,25 +1107,53 @@ def find_routes(topic, limit=10, validate_paths=True):
     return matches[:limit]
 
 
-def list_docs(prefix=""):
+def list_docs(prefix="", limit=100, offset=0):
     """List documents, optionally filtered by path prefix.
 
     Args:
-        prefix: Optional path prefix to filter documents (e.g., "docs/api/")
+        prefix: Path prefix to filter (e.g., "_platform/") - USE THIS for large repos!
+        limit: Max results to return (default 100, max 1000)
+        offset: Skip first N matching docs (for pagination)
 
     Returns:
-        List of dicts with keys: id, path, size, start, end (max 1000 items)
+        dict with keys:
+            docs: List of {id, path, size, start, end}
+            total: Total matching docs (before limit)
+            truncated: True if more results exist
     """
     data = _state.get("document_list_json")
     if not data:
-        return []
+        return {"docs": [], "total": 0, "truncated": False}
+
+    all_docs = json.loads(data)
+    if prefix:
+        all_docs = [d for d in all_docs if d.get("id", "").startswith(prefix)]
+
+    total = len(all_docs)
+    limit = min(limit, 1000)  # Cap at 1000 per spec
+    docs = all_docs[offset:offset + limit]
+    truncated = (offset + limit) < total
+
+    return {"docs": docs, "total": total, "truncated": truncated}
+
+
+def count_docs(prefix=""):
+    """Count documents matching a prefix (fast, no data transfer).
+
+    Args:
+        prefix: Optional path prefix to filter
+
+    Returns:
+        int: Number of matching documents
+    """
+    data = _state.get("document_list_json")
+    if not data:
+        return 0
 
     docs = json.loads(data)
     if prefix:
-        docs = [d for d in docs if d.get("id", "").startswith(prefix)]
-
-    # Cap at 1000 items per spec
-    return docs[:1000]
+        return sum(1 for d in docs if d.get("id", "").startswith(prefix))
+    return len(docs)
 
 
 def agents_files():
@@ -1204,7 +1364,10 @@ else:
         # Clear file access tracking for this execution
         _state["_files_accessed"] = set()
         # Re-add the required helper functions
+        _exec_globals['help'] = help
         _exec_globals['peek'] = peek
+        _exec_globals['peek_doc'] = peek_doc
+        _exec_globals['get_doc'] = get_doc
         _exec_globals['files_accessed'] = files_accessed
         _exec_globals['find'] = find
         _exec_globals['stats'] = stats
@@ -1220,6 +1383,7 @@ else:
         _exec_globals['search'] = search
         _exec_globals['find_routes'] = find_routes
         _exec_globals['list_docs'] = list_docs
+        _exec_globals['count_docs'] = count_docs
         _exec_globals['agents_files'] = agents_files
         _exec_globals['route_path'] = route_path
         _exec_globals['P'] = P

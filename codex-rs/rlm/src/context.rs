@@ -623,8 +623,10 @@ impl DocTreeStore {
             }
             let separator = format!("===== {rel_path} =====\n");
             combined.push_str(&separator);
-            let content_offset = combined.len(); // After separator
+            // Use character count, not byte count - Python slicing uses char indices
+            let content_offset = combined.chars().count();
             combined.push_str(&content);
+            let content_chars = content.chars().count();
 
             let doc = Document {
                 id: rel_path.clone(),
@@ -637,9 +639,9 @@ impl DocTreeStore {
             doc_metadata.push(DocumentMetadata {
                 id: rel_path.clone(),
                 path: rel_path.clone(), // Use relative path per spec
-                size,
+                size: content_chars, // Character count for Python slicing
                 start: content_offset,
-                end: content_offset + size,
+                end: content_offset + content_chars,
                 source: None, // Set by RlmSession during load
             });
 
