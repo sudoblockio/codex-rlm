@@ -1237,7 +1237,7 @@ result = {'text': text, 'match_count': len(find_result['matches']), 'capped': fi
         let outcome = session
             .exec(
                 r#"
-docs = list_docs()
+docs = list_docs()["docs"]
 ids = [d['id'] for d in docs]
 sources = [d.get('source') for d in docs]
 result = {

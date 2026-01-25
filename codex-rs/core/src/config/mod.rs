@@ -118,10 +118,11 @@ const RLM_TOOL_INSTRUCTIONS: &str = r#"
 - `peek_doc(doc_id, start, end)` — Read slice within a file
 
 **Searching:**
-- `find(pattern)` — Regex search → `{matches: [{start, end, id}...], capped}`
+- `find(pattern)` — Regex → `{matches: [{id, line, text, start, end}...], capped}`
+- `find_grouped(pattern)` — Regex grouped by file → `{files: {id: [{line, text}...]}, total}`
 - `search(query, k)` — BM25 semantic → `[{text, score, start, end, id}...]`
 
-Both return `id` (same as list_docs) so you can call `peek_doc(result["id"])` on results.
+Results include `id`, `line`, and `text` — no need for extra peek_doc calls!
 
 **Routing:**
 - `routing_coverage()` — `{loaded, missing, coverage_pct}` for navigation links
