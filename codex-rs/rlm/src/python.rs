@@ -527,14 +527,14 @@ def help(topic=None):
             "tip": "Prefer peek_doc(doc_id) to avoid offset confusion",
         },
         "find": {
-            "sig": "find(pattern, flags=None, context=True)",
-            "desc": "Regex search - returns {matches: [{id, line, text, start, end}...], capped}",
-            "tip": "Includes line number and text; set context=False for speed",
+            "sig": "find(pattern, prefix=None)",
+            "desc": "Regex search - returns {matches: [{id, line, text}...], capped}",
+            "tip": "Use prefix='_platform/' to filter by path; includes line+text",
         },
         "find_grouped": {
-            "sig": "find_grouped(pattern, flags=None)",
-            "desc": "Find grouped by file - returns {files: {id: [{line, text}...]}, total, capped}",
-            "tip": "Perfect for audit reports; groups matches by document",
+            "sig": "find_grouped(pattern, prefix=None)",
+            "desc": "Find grouped by file - returns {files: {id: [{line, text}...]}, total}",
+            "tip": "Perfect for audits: find_grouped(r'infra/', prefix='_platform/')",
         },
         "search": {
             "sig": "search(query, k=10)",
@@ -740,13 +740,14 @@ def _get_line_info(pos):
     return line_num, line_text
 
 
-def find(pattern, flags=None, context=True):
+def find(pattern, flags=None, context=True, prefix=None):
     """Find all matches of pattern in context.
 
     Args:
         pattern: Regex pattern (uses Rust regex engine - linear time, no ReDoS).
         flags: Optional regex flags string ('i' for case-insensitive, etc.)
         context: Include line number and text (default True, set False for speed)
+        prefix: Only include matches from docs with this path prefix (e.g., "_platform/")
 
     Returns:
         dict with keys:
@@ -759,6 +760,9 @@ def find(pattern, flags=None, context=True):
     capped = False
     for match in compiled.finditer(P):
         doc_id = _find_doc_at_offset(match.start())
+        # Skip if prefix filter doesn't match
+        if prefix and (not doc_id or not doc_id.startswith(prefix)):
+            continue
         result = {
             "start": match.start(),
             "end": match.end(),
@@ -776,17 +780,18 @@ def find(pattern, flags=None, context=True):
     return {"matches": matches, "capped": capped}
 
 
-def find_grouped(pattern, flags=None):
+def find_grouped(pattern, flags=None, prefix=None):
     """Find matches grouped by file (for audit reports).
 
     Args:
         pattern: Regex pattern
         flags: Optional regex flags string
+        prefix: Only include matches from docs with this path prefix (e.g., "_platform/")
 
     Returns:
-        dict mapping doc_id -> list of {line, text, start, end}
+        dict with files grouped by doc_id, total count, and capped flag
     """
-    result = find(pattern, flags, context=True)
+    result = find(pattern, flags, context=True, prefix=prefix)
     grouped = {}
     for m in result["matches"]:
         doc_id = m.get("id") or "(unknown)"

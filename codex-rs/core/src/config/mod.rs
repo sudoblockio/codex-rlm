@@ -100,10 +100,27 @@ const RLM_TOOL_INSTRUCTIONS: &str = r#"
 **IMPORTANT: After rlm_load, call `help()` in rlm_exec to see all available builtins.**
 
 ### Tools
-- **rlm_load(path)**: Load file/directory into context (resets state)
-- **rlm_load_append(path)**: Add more files (preserves state)
-- **rlm_query(prompt)**: Quick read-only question about the context
+- **rlm_load(path)**: Load file/directory into context (resets ALL state)
+- **rlm_load_append(path)**: Add more files WITHOUT resetting (keeps memory + Python state)
+- **rlm_query(prompt)**: Ask sub-agent to analyze context (natural language)
 - **rlm_exec(code)**: Python execution with builtins (see below)
+- **rlm_memory_put/get/list/clear**: Persistent key-value store across tool calls
+
+### When to Use rlm_query vs rlm_exec
+
+**Use rlm_query for:**
+- Open-ended questions: "What patterns does this codebase use?"
+- Summaries: "Summarize the error handling approach"
+- Analysis: "What are the main dependencies between these modules?"
+- Quick exploration: "Find all places where user auth is handled"
+
+**Use rlm_exec for:**
+- Precise searches: `find(r'class.*Error')` for exact regex matches
+- Counting/filtering: `count_docs('src/')` to check scope
+- Structured output: `find_grouped()` for audit reports
+- Multi-step analysis: combine search results with peek_doc
+
+**Pro tip:** Start with `rlm_query` for understanding, then switch to `rlm_exec` for precise extraction.
 
 ### Key Builtins (inside rlm_exec)
 
@@ -118,17 +135,42 @@ const RLM_TOOL_INSTRUCTIONS: &str = r#"
 - `peek_doc(doc_id, start, end)` — Read slice within a file
 
 **Searching:**
-- `find(pattern)` — Regex → `{matches: [{id, line, text, start, end}...], capped}`
-- `find_grouped(pattern)` — Regex grouped by file → `{files: {id: [{line, text}...]}, total}`
+- `find(pattern, prefix=None)` — Regex → `{matches: [{id, line, text}...], capped}`
+- `find_grouped(pattern, prefix=None)` — Regex grouped by file → `{files: {id: [{line, text}...]}, total}`
 - `search(query, k)` — BM25 semantic → `[{text, score, start, end, id}...]`
 
+Use `prefix='_platform/'` to filter results to specific paths — essential for large repos!
 Results include `id`, `line`, and `text` — no need for extra peek_doc calls!
 
 **Routing:**
 - `routing_coverage()` — `{loaded, missing, coverage_pct}` for navigation links
 - `find_routes(topic)` — Find AGENTS.md entries matching topic
 
-### Workflow
+### Memory Tools (Multi-Pass Analysis)
+
+Store findings across multiple rlm_exec calls:
+- `rlm_memory_put(key, value)` — Store any JSON value
+- `rlm_memory_get(key)` — Retrieve stored value
+- `rlm_memory_list()` — List all stored keys
+- `rlm_memory_clear()` — Reset memory
+- `rlm_memory_batch(ops)` — Batch put/get operations
+
+**Use for:** Collecting code snippets, tracking findings, building reports across passes.
+
+Example multi-pass workflow:
+```
+# Pass 1: Find all error patterns, store in memory
+rlm_exec("errors = find_grouped(r'class.*Error'); print(errors)")
+rlm_memory_put("errors", errors_result)
+
+# Pass 2: Load more files without losing memory
+rlm_load_append("/more/files")  # Memory preserved!
+
+# Pass 3: Cross-reference with stored findings
+rlm_memory_get("errors")  # Still there
+```
+
+### Basic Workflow
 ```
 rlm_load("/path") → rlm_exec("print(help())") → rlm_exec("stats()") → search/find → peek_doc
 ```
@@ -136,6 +178,7 @@ rlm_load("/path") → rlm_exec("print(help())") → rlm_exec("stats()") → sear
 ### Common Mistakes
 - DON'T use raw `peek(start, end)` — offsets are confusing; use `peek_doc(doc_id)` instead
 - DON'T grep manually — use `find(pattern)` or `search(query)` which return doc_id
+- DO use `prefix=` when results are capped — e.g. `find_grouped(r'pattern', prefix='src/')`
 - DO check `stats()["broken_links"]` after load to detect invalid routing paths
 "#;
 
