@@ -25,14 +25,10 @@ RLM (Recursive Language Model) is an embedded Python runtime that enables agents
 - [RLM Installation Guide](./codex-rs/rlm/INSTALL.md) — Prerequisites and build instructions (requires Python 3.11+)
 
 **Quick Start:**
-```python
-# In rlm_exec after rlm_load("/path/to/codebase")
-docs = list_docs()                    # See available files
-content = peek_doc("src/main.rs")     # Read specific file
-matches = find(r"fn main")            # Regex search
-results = search("authentication", k=5)  # BM25 semantic search
-stats()                               # Check for broken_links
-```
+
+Add to your AGENTS.md file something like:
+
+Use RLM for tasks that require reading and analyzing large context.
 
 ---
 

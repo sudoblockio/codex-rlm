@@ -106,10 +106,6 @@ experimental_supported_tools = [
   "grep"
 ]
 
-# Optional: Configure RLM gateway model
-[rlm.gateway]
-model = "gpt-4"
-
 # Optional: Sub-agent tool policy
 [rlm.sub_agent_policy]
 allowed_tool_overrides = ["shell", "apply_patch"]

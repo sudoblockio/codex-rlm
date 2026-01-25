@@ -43,6 +43,71 @@ RETURN STRUCTURED DATA
   result_meta = {"page": 1}   → returned as result_meta (optional)
 ```
 
+```mermaid
+graph TB
+    subgraph "User Interface Layer"
+        TUI[Terminal UI<br/>ratatui]
+        CLI[CLI Entry Point]
+    end
+
+    subgraph "Core Agent"
+        SQ[Submission Queue<br/>async_channel]
+        SL[Submission Loop<br/>Main Agent Loop]
+        SM[Session Manager]
+        TR[Tool Registry]
+        MC[Model Client<br/>Responses API]
+    end
+
+    subgraph "Tool Execution Layer"
+        FT[Function Tools<br/>shell, read_file, apply_patch]
+        RT[RLM Tools<br/>rlm_load, rlm_exec, rlm_query]
+        MT[MCP Tools<br/>External Servers]
+    end
+
+    subgraph "RLM Runtime"
+        RS[RLM Session]
+        PR[Python Runtime<br/>PyO3]
+        BM[BM25 Index]
+        SA[Sub-Agents]
+    end
+
+    subgraph "State & Persistence"
+        SS[Session State]
+        CM[Context Manager]
+        HF[History File<br/>JSONL]
+    end
+
+    subgraph "Security Layer"
+        AP[Approval Policy]
+        SB[Sandbox<br/>Seatbelt/Landlock]
+        TG[Tool Gate]
+    end
+
+    CLI --> TUI
+    TUI --> SQ
+    SQ --> SL
+    SL --> SM
+    SL --> TR
+    SL --> MC
+
+    TR --> FT
+    TR --> RT
+    TR --> MT
+
+    RT --> RS
+    RS --> PR
+    RS --> BM
+    RS --> SA
+
+    SM --> SS
+    SM --> CM
+    CM --> HF
+
+    FT --> AP
+    FT --> SB
+    TR --> TG
+```
+
 ---
 
 ## Executive Summary
