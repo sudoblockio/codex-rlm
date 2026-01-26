@@ -10,6 +10,7 @@ use crate::rlm_sub_agent::run_sub_agent;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::rlm_types::emit_rlm_activity;
 use crate::tools::handlers::rlm_types::error_value;
 use crate::tools::handlers::rlm_types::json_tool_output;
 use crate::tools::registry::ToolHandler;
@@ -53,6 +54,7 @@ impl ToolHandler for RlmQueryHandler {
             payload,
             session,
             turn,
+            call_id,
             ..
         } = invocation;
 
@@ -85,6 +87,22 @@ impl ToolHandler for RlmQueryHandler {
             );
             return Ok(json_tool_output(value, false));
         }
+
+        // Create a short prompt preview for the activity event
+        let prompt_preview = if prompt.len() > 50 {
+            format!("{}...", &prompt[..50].replace('\n', " "))
+        } else {
+            prompt.replace('\n', " ")
+        };
+        emit_rlm_activity(
+            &session,
+            &turn,
+            &call_id,
+            "rlm_query",
+            &format!("Querying: {prompt_preview}"),
+            false,
+        )
+        .await;
 
         let rlm_session = session
             .rlm_session()
@@ -139,6 +157,17 @@ impl ToolHandler for RlmQueryHandler {
             )
             .await?
         };
+
+        // Emit activity complete
+        emit_rlm_activity(
+            &session,
+            &turn,
+            &call_id,
+            "rlm_query",
+            &format!("Analyzed {} sections", sections.len()),
+            true,
+        )
+        .await;
 
         let budget = {
             let guard = rlm_session.lock().await;

@@ -8,6 +8,7 @@ use crate::rlm_session::RlmSession;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::rlm_types::emit_rlm_status;
 use crate::tools::handlers::rlm_types::error_value;
 use crate::tools::handlers::rlm_types::json_tool_output;
 use crate::tools::registry::ToolHandler;
@@ -52,6 +53,7 @@ impl ToolHandler for RlmMemoryHandler {
         let ToolInvocation {
             payload,
             session,
+            turn,
             tool_name,
             ..
         } = invocation;
@@ -69,69 +71,84 @@ impl ToolHandler for RlmMemoryHandler {
             .rlm_session()
             .await
             .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
-        let mut guard = rlm_session.lock().await;
 
-        match tool_name.as_str() {
-            "rlm_memory_put" => {
-                let args: RlmMemoryPutArgs = parse_arguments(&arguments)?;
-                match guard.memory_put(args.key.clone(), args.value) {
-                    Ok(()) => Ok(json_tool_output(
-                        json!({"success": true, "key": args.key}),
-                        true,
-                    )),
-                    Err(err) => {
-                        let value = error_value(
-                            "memory_limit_exceeded",
-                            err.to_string(),
-                            Some("Clear memory or reduce stored values"),
-                        );
-                        Ok(json_tool_output(value, false))
+        // Perform operations while holding the lock, track if state changed
+        let (output, state_changed) = {
+            let mut guard = rlm_session.lock().await;
+
+            match tool_name.as_str() {
+                "rlm_memory_put" => {
+                    let args: RlmMemoryPutArgs = parse_arguments(&arguments)?;
+                    match guard.memory_put(args.key.clone(), args.value) {
+                        Ok(()) => (
+                            json_tool_output(json!({"success": true, "key": args.key}), true),
+                            true,
+                        ),
+                        Err(err) => {
+                            let value = error_value(
+                                "memory_limit_exceeded",
+                                err.to_string(),
+                                Some("Clear memory or reduce stored values"),
+                            );
+                            (json_tool_output(value, false), false)
+                        }
                     }
                 }
-            }
-            "rlm_memory_get" => {
-                let args: RlmMemoryGetArgs = parse_arguments(&arguments)?;
-                let value = guard.memory_get(&args.key);
-                Ok(json_tool_output(
-                    json!({"success": true, "key": args.key, "value": value}),
-                    true,
-                ))
-            }
-            "rlm_memory_list" => {
-                let keys = guard.memory_keys();
-                Ok(json_tool_output(
-                    json!({"success": true, "keys": keys}),
-                    true,
-                ))
-            }
-            "rlm_memory_clear" => match guard.memory_clear() {
-                Ok(()) => Ok(json_tool_output(json!({"success": true}), true)),
-                Err(err) => {
-                    let value = error_value(
-                        "memory_error",
-                        err.to_string(),
-                        Some("Retry clearing memory"),
-                    );
-                    Ok(json_tool_output(value, false))
+                "rlm_memory_get" => {
+                    let args: RlmMemoryGetArgs = parse_arguments(&arguments)?;
+                    let value = guard.memory_get(&args.key);
+                    (
+                        json_tool_output(
+                            json!({"success": true, "key": args.key, "value": value}),
+                            true,
+                        ),
+                        false,
+                    )
                 }
-            },
-            "rlm_memory_batch" => {
-                let args: RlmMemoryBatchArgs = parse_arguments(&arguments)?;
-                let results = apply_memory_batch(&mut guard, args.ops);
-                Ok(json_tool_output(
-                    json!({"success": true, "results": results}),
-                    true,
-                ))
+                "rlm_memory_list" => {
+                    let keys = guard.memory_keys();
+                    (
+                        json_tool_output(json!({"success": true, "keys": keys}), true),
+                        false,
+                    )
+                }
+                "rlm_memory_clear" => match guard.memory_clear() {
+                    Ok(()) => (json_tool_output(json!({"success": true}), true), true),
+                    Err(err) => {
+                        let value = error_value(
+                            "memory_error",
+                            err.to_string(),
+                            Some("Retry clearing memory"),
+                        );
+                        (json_tool_output(value, false), false)
+                    }
+                },
+                "rlm_memory_batch" => {
+                    let args: RlmMemoryBatchArgs = parse_arguments(&arguments)?;
+                    let has_puts = args.ops.iter().any(|op| op.op == "put");
+                    let results = apply_memory_batch(&mut guard, args.ops);
+                    (
+                        json_tool_output(json!({"success": true, "results": results}), true),
+                        has_puts,
+                    )
+                }
+                _ => {
+                    let value = error_value(
+                        "unsupported_tool",
+                        format!("unsupported rlm memory tool: {tool_name}"),
+                        Some("Use rlm_memory_put, rlm_memory_get, rlm_memory_list, rlm_memory_clear, or rlm_memory_batch"),
+                    );
+                    (json_tool_output(value, false), false)
+                }
             }
-            _ => {
-                let value = error_value(
-                    "unsupported_tool",
-                    format!("unsupported rlm memory tool: {tool_name}"),
-                    Some("Use rlm_memory_put, rlm_memory_get, rlm_memory_list, rlm_memory_clear, or rlm_memory_batch"),
-                );
-                Ok(json_tool_output(value, false))
-            }
+        }; // Guard released here
+
+        // Emit status update if state changed
+        if state_changed {
+            emit_rlm_status(&session, &turn, &rlm_session).await;
         }
+
+        Ok(output)
     }
 }
 

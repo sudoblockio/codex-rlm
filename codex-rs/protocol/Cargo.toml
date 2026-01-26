@@ -11,6 +11,10 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+rlm = []
+
 [dependencies]
 codex-git = { workspace = true }
 codex-utils-absolute-path = { workspace = true }

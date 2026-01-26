@@ -14,6 +14,7 @@ use crate::rlm_sub_agent::tool_override_policy_json;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::rlm_types::emit_rlm_activity;
 use crate::tools::handlers::rlm_types::error_value;
 use crate::tools::handlers::rlm_types::json_tool_output;
 use crate::tools::registry::ToolHandler;
@@ -42,6 +43,7 @@ impl ToolHandler for RlmExecHandler {
             payload,
             session,
             turn,
+            call_id,
             ..
         } = invocation;
 
@@ -82,6 +84,22 @@ impl ToolHandler for RlmExecHandler {
             return Ok(json_tool_output(value, false));
         }
 
+        // Create a short code preview for the activity event
+        let code_preview = if code.len() > 50 {
+            format!("{}...", &code[..50].replace('\n', " "))
+        } else {
+            code.replace('\n', " ")
+        };
+        emit_rlm_activity(
+            &session,
+            &turn,
+            &call_id,
+            "rlm_exec",
+            &format!("Executing Python: {code_preview}"),
+            false,
+        )
+        .await;
+
         let code = code.to_string();
         let limits_override = args.limits_override.clone();
         let budget_state = {
@@ -110,6 +128,17 @@ impl ToolHandler for RlmExecHandler {
         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
         let execution_time_ms = start.elapsed().as_millis() as u64;
+
+        // Emit activity complete
+        emit_rlm_activity(
+            &session,
+            &turn,
+            &call_id,
+            "rlm_exec",
+            &format!("Executed in {execution_time_ms}ms"),
+            true,
+        )
+        .await;
 
         Ok(build_exec_response(outcome, execution_time_ms))
     }

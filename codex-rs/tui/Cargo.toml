@@ -19,7 +19,7 @@ vt100-tests = []
 # Gate verbose debug logging inside the TUI implementation.
 debug-logs = []
 # Enable RLM tool support
-rlm = ["codex-core/rlm"]
+rlm = ["codex-core/rlm", "codex-protocol/rlm"]
 
 [lints]
 workspace = true

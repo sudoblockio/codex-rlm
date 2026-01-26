@@ -1,11 +1,18 @@
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::codex::Session;
+use crate::codex::TurnContext;
+use crate::protocol::EventMsg;
+use crate::protocol::RlmToolActivityEvent;
 use crate::protocol::SandboxPolicy;
+use crate::rlm_session::RlmSession;
 use crate::tools::context::ToolOutput;
+use tokio::sync::Mutex;
 
 pub(crate) fn json_tool_output(value: Value, success: bool) -> ToolOutput {
     let content = serde_json::to_string(&value).unwrap_or_else(|err| {
@@ -142,6 +149,43 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Emit an RLM tool activity event (start or end).
+pub(crate) async fn emit_rlm_activity(
+    session: &Session,
+    turn: &TurnContext,
+    call_id: &str,
+    tool_name: &str,
+    description: &str,
+    is_complete: bool,
+) {
+    session
+        .send_event(
+            turn,
+            EventMsg::RlmToolActivity(RlmToolActivityEvent {
+                call_id: call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                description: description.to_string(),
+                is_complete,
+            }),
+        )
+        .await;
+}
+
+/// Emit an RLM status snapshot event after state changes.
+pub(crate) async fn emit_rlm_status(
+    session: &Session,
+    turn: &TurnContext,
+    rlm_session: &Arc<Mutex<RlmSession>>,
+) {
+    let snapshot = {
+        let guard = rlm_session.lock().await;
+        guard.to_status_snapshot()
+    };
+    session
+        .send_event(turn, EventMsg::RlmStatus(snapshot))
+        .await;
 }
 
 #[cfg(test)]

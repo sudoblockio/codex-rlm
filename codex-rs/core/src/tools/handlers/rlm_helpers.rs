@@ -6,6 +6,7 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::rlm_types::emit_rlm_status;
 use crate::tools::handlers::rlm_types::error_value;
 use crate::tools::handlers::rlm_types::json_tool_output;
 use crate::tools::registry::ToolHandler;
@@ -40,6 +41,7 @@ impl ToolHandler for RlmHelpersHandler {
         let ToolInvocation {
             payload,
             session,
+            turn,
             tool_name,
             ..
         } = invocation;
@@ -83,6 +85,9 @@ impl ToolHandler for RlmHelpersHandler {
                     }
                     guard.helpers_list()
                 };
+
+                // Emit status update after helper added
+                emit_rlm_status(&session, &turn, &rlm_session).await;
 
                 let value = json!({
                     "success": true,
@@ -129,6 +134,11 @@ impl ToolHandler for RlmHelpersHandler {
                         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
                     (removed, guard.helpers_list())
                 };
+
+                // Emit status update if helper was removed
+                if removed {
+                    emit_rlm_status(&session, &turn, &rlm_session).await;
+                }
 
                 let value = json!({
                     "success": true,

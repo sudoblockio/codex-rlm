@@ -38,9 +38,13 @@ use super::rate_limits::StatusRateLimitValue;
 use super::rate_limits::compose_rate_limit_data;
 use super::rate_limits::format_status_limit_summary;
 use super::rate_limits::render_status_limit_progress_bar;
+#[cfg(feature = "rlm")]
+use super::rlm::StatusRlmData;
 use crate::wrapping::RtOptions;
 use crate::wrapping::word_wrap_lines;
 use codex_core::AuthManager;
+#[cfg(feature = "rlm")]
+use codex_protocol::protocol::RlmStatusSnapshot;
 
 #[derive(Debug, Clone)]
 struct StatusContextWindowData {
@@ -72,6 +76,8 @@ struct StatusHistoryCell {
     forked_from: Option<String>,
     token_usage: StatusTokenUsageData,
     rate_limits: StatusRateLimitData,
+    #[cfg(feature = "rlm")]
+    rlm_data: Option<StatusRlmData>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -88,6 +94,7 @@ pub(crate) fn new_status_output(
     model_name: &str,
     collaboration_mode: Option<&str>,
     reasoning_effort_override: Option<Option<ReasoningEffort>>,
+    #[cfg(feature = "rlm")] rlm_status: Option<&RlmStatusSnapshot>,
 ) -> CompositeHistoryCell {
     let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
     let card = StatusHistoryCell::new(
@@ -103,6 +110,8 @@ pub(crate) fn new_status_output(
         model_name,
         collaboration_mode,
         reasoning_effort_override,
+        #[cfg(feature = "rlm")]
+        rlm_status,
     );
 
     CompositeHistoryCell::new(vec![Box::new(command), Box::new(card)])
@@ -123,6 +132,7 @@ impl StatusHistoryCell {
         model_name: &str,
         collaboration_mode: Option<&str>,
         reasoning_effort_override: Option<Option<ReasoningEffort>>,
+        #[cfg(feature = "rlm")] rlm_status: Option<&RlmStatusSnapshot>,
     ) -> Self {
         let mut config_entries = vec![
             ("workdir", config.cwd.display().to_string()),
@@ -187,6 +197,9 @@ impl StatusHistoryCell {
         };
         let rate_limits = compose_rate_limit_data(rate_limits, now);
 
+        #[cfg(feature = "rlm")]
+        let rlm_data = rlm_status.map(StatusRlmData::from_snapshot);
+
         Self {
             model_name,
             model_details,
@@ -201,6 +214,8 @@ impl StatusHistoryCell {
             forked_from,
             token_usage,
             rate_limits,
+            #[cfg(feature = "rlm")]
+            rlm_data,
         }
     }
 
@@ -400,6 +415,11 @@ impl HistoryCell for StatusHistoryCell {
 
         self.collect_rate_limit_labels(&mut seen, &mut labels);
 
+        #[cfg(feature = "rlm")]
+        if let Some(rlm) = &self.rlm_data {
+            rlm.collect_labels(&mut labels, &mut seen);
+        }
+
         let formatter = FieldFormatter::from_labels(labels.iter().map(String::as_str));
         let value_width = formatter.value_width(available_inner_width);
 
@@ -466,6 +486,13 @@ impl HistoryCell for StatusHistoryCell {
         }
 
         lines.extend(self.rate_limit_lines(available_inner_width, &formatter));
+
+        // RLM status section
+        #[cfg(feature = "rlm")]
+        if let Some(rlm) = &self.rlm_data {
+            lines.push(Line::from(Vec::<Span<'static>>::new()));
+            lines.extend(rlm.render_lines(&formatter));
+        }
 
         let content_width = lines.iter().map(line_display_width).max().unwrap_or(0);
         let inner_width = content_width.min(available_inner_width);

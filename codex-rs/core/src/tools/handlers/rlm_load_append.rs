@@ -9,6 +9,8 @@ use crate::rlm_session::RlmLoadMode;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::rlm_types::emit_rlm_activity;
+use crate::tools::handlers::rlm_types::emit_rlm_status;
 use crate::tools::handlers::rlm_types::json_tool_output;
 use crate::tools::handlers::rlm_types::validate_path_in_sandbox;
 use crate::tools::registry::ToolHandler;
@@ -35,6 +37,7 @@ impl ToolHandler for RlmLoadAppendHandler {
             payload,
             session,
             turn,
+            call_id,
             ..
         } = invocation;
 
@@ -55,6 +58,18 @@ impl ToolHandler for RlmLoadAppendHandler {
             return Ok(json_tool_output(value, false));
         }
 
+        // Emit activity start event
+        let path_display = path.display().to_string();
+        emit_rlm_activity(
+            &session,
+            &turn,
+            &call_id,
+            "rlm_load_append",
+            &format!("Appending files from {path_display}..."),
+            false,
+        )
+        .await;
+
         let rlm_session = session
             .rlm_session()
             .await
@@ -66,6 +81,18 @@ impl ToolHandler for RlmLoadAppendHandler {
                 .await
                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
         };
+
+        // Emit activity complete and status update
+        emit_rlm_activity(
+            &session,
+            &turn,
+            &call_id,
+            "rlm_load_append",
+            &format!("Appended {} files", stats.document_count),
+            true,
+        )
+        .await;
+        emit_rlm_status(&session, &turn, &rlm_session).await;
 
         let value = json!({
             "success": true,
