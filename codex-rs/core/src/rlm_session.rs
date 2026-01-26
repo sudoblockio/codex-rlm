@@ -467,6 +467,31 @@ impl RlmSession {
         &*self.context
     }
 
+    /// Get the content of a document by its path.
+    ///
+    /// Searches for a document whose path matches or ends with the given path.
+    /// Returns the document content extracted from the combined context.
+    pub(crate) fn document_content(&self, path: &str) -> Option<&str> {
+        // Try exact match first
+        let doc = self
+            .documents
+            .iter()
+            .find(|d| d.path == path || d.id == path)
+            .or_else(|| {
+                // Try suffix match (e.g., "AGENTS.md" matches "docs/AGENTS.md")
+                self.documents
+                    .iter()
+                    .find(|d| d.path.ends_with(path) || path.ends_with(&d.path))
+            })?;
+
+        self.context.get(doc.start..doc.end)
+    }
+
+    /// List all document paths in the loaded context.
+    pub(crate) fn document_paths(&self) -> Vec<&str> {
+        self.documents.iter().map(|d| d.path.as_str()).collect()
+    }
+
     pub(crate) fn has_routing(&self) -> bool {
         self.routing_graph
             .as_ref()

@@ -223,24 +223,59 @@ fn routing_sections(session: &RlmSession, prompt: &str, max_sections: usize) -> 
     let Some(graph) = session.routing_graph() else {
         return Vec::new();
     };
-    graph
-        .find_routes(prompt)
-        .into_iter()
-        .take(max_sections)
-        .map(|route| {
-            let entry = route.entry;
-            let agents_path = route.agents_path;
-            Section {
-                content: format!(
-                    "agents_path: {agents_path}\nlabel: {label}\npath: {path}\ndescription: {description}\nscore: {score:.2}\n",
-                    label = entry.label,
-                    path = entry.path,
-                    description = entry.description,
-                    score = route.score
-                ),
+
+    let mut sections = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+
+    for route in graph.find_routes(prompt).into_iter().take(max_sections * 2) {
+        let entry = &route.entry;
+
+        // Skip if we've already included this path
+        if seen_paths.contains(&entry.path) {
+            continue;
+        }
+
+        // Try to get the actual document content
+        if let Some(content) = session.document_content(&entry.path) {
+            seen_paths.insert(entry.path.clone());
+
+            // Include metadata header followed by actual content
+            let header = format!(
+                "# {} ({})\n## Path: {}\n## Description: {}\n\n",
+                entry.label, route.agents_path, entry.path, entry.description
+            );
+
+            // Truncate content if too long (keep first ~4000 chars)
+            let truncated_content = if content.len() > 4000 {
+                format!("{}...\n[Content truncated]", &content[..4000])
+            } else {
+                content.to_string()
+            };
+
+            sections.push(Section {
+                content: format!("{header}{truncated_content}"),
+            });
+
+            if sections.len() >= max_sections {
+                break;
             }
-        })
-        .collect()
+        }
+    }
+
+    // If no content found via routing paths, fall back to metadata only
+    if sections.is_empty() {
+        for route in graph.find_routes(prompt).into_iter().take(max_sections) {
+            let entry = route.entry;
+            sections.push(Section {
+                content: format!(
+                    "Route: {} -> {}\nLabel: {}\nDescription: {}\nScore: {:.2}\n(Document content not found in loaded context)",
+                    route.agents_path, entry.path, entry.label, entry.description, route.score
+                ),
+            });
+        }
+    }
+
+    sections
 }
 
 fn build_query_prompt(prompt: &str, sections: &[Section]) -> String {
