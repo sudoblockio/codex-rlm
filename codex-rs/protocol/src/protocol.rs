@@ -830,6 +830,12 @@ pub enum EventMsg {
     CollabCloseBegin(CollabCloseBeginEvent),
     /// Collab interaction: close end.
     CollabCloseEnd(CollabCloseEndEvent),
+
+    /// RLM session status update.
+    RlmStatus(RlmStatusSnapshot),
+
+    /// RLM tool activity (for status indicator).
+    RlmToolActivity(RlmToolActivityEvent),
 }
 
 impl From<CollabAgentSpawnBeginEvent> for EventMsg {
@@ -2316,6 +2322,52 @@ pub struct CollabCloseEndEvent {
     /// Last known status of the receiver agent reported to the sender agent before
     /// the close.
     pub status: AgentStatus,
+}
+
+// ============================================================================
+// RLM (Recursive Language Model) Events
+// ============================================================================
+
+/// RLM session status snapshot for TUI display.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct RlmStatusSnapshot {
+    /// Whether context is currently loaded.
+    pub context_loaded: bool,
+    /// Sources loaded (file/directory paths).
+    pub sources: Vec<String>,
+    /// Document count in context.
+    pub document_count: usize,
+    /// Token estimate for loaded context.
+    pub token_estimate: u64,
+    /// Character count of context.
+    pub char_count: usize,
+    /// Whether routing graph is available.
+    pub has_routing: bool,
+    /// Number of routing entries.
+    pub routing_entry_count: usize,
+    /// Memory keys stored.
+    pub memory_keys: Vec<String>,
+    /// Memory bytes used.
+    pub memory_bytes_used: usize,
+    /// Helper function names.
+    pub helpers: Vec<String>,
+    /// Helper bytes used.
+    pub helpers_bytes_used: usize,
+    /// Budget tokens remaining.
+    pub budget_remaining_tokens: u64,
+}
+
+/// RLM tool activity event for status indicator.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct RlmToolActivityEvent {
+    /// Tool call ID.
+    pub call_id: String,
+    /// Tool name (rlm_load, rlm_exec, etc.).
+    pub tool_name: String,
+    /// Human-readable description for status indicator.
+    pub description: String,
+    /// Whether the activity is complete.
+    pub is_complete: bool,
 }
 
 #[cfg(test)]

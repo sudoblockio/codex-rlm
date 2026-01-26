@@ -25,6 +25,7 @@ use codex_rlm::python::ResourceLimits;
 use codex_rlm::SearchCallback;
 use codex_rlm::SearchResultJson;
 use codex_rlm::routing::HierarchicalRoutingGraph;
+use codex_protocol::protocol::RlmStatusSnapshot;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -466,6 +467,31 @@ impl RlmSession {
         &*self.context
     }
 
+    /// Get the content of a document by its path.
+    ///
+    /// Searches for a document whose path matches or ends with the given path.
+    /// Returns the document content extracted from the combined context.
+    pub(crate) fn document_content(&self, path: &str) -> Option<&str> {
+        // Try exact match first
+        let doc = self
+            .documents
+            .iter()
+            .find(|d| d.path == path || d.id == path)
+            .or_else(|| {
+                // Try suffix match (e.g., "AGENTS.md" matches "docs/AGENTS.md")
+                self.documents
+                    .iter()
+                    .find(|d| d.path.ends_with(path) || path.ends_with(&d.path))
+            })?;
+
+        self.context.get(doc.start..doc.end)
+    }
+
+    /// List all document paths in the loaded context.
+    pub(crate) fn document_paths(&self) -> Vec<&str> {
+        self.documents.iter().map(|d| d.path.as_str()).collect()
+    }
+
     pub(crate) fn has_routing(&self) -> bool {
         self.routing_graph
             .as_ref()
@@ -485,6 +511,26 @@ impl RlmSession {
             .ok()
             .and_then(|guard| guard.as_ref().map(|index| index.search(query, k, context)))
             .unwrap_or_default()
+    }
+
+    /// Create a status snapshot for TUI display.
+    pub(crate) fn to_status_snapshot(&self) -> RlmStatusSnapshot {
+        let stats = self.stats();
+        let budget = self.budget_snapshot();
+        RlmStatusSnapshot {
+            context_loaded: self.has_context(),
+            sources: stats.sources,
+            document_count: stats.document_count,
+            token_estimate: stats.length_tokens_estimate,
+            char_count: stats.length_chars,
+            has_routing: stats.has_routing,
+            routing_entry_count: stats.routing_entry_count,
+            memory_keys: self.memory_keys(),
+            memory_bytes_used: self.memory_bytes_used(),
+            helpers: self.helpers_list(),
+            helpers_bytes_used: self.helpers_bytes_used(),
+            budget_remaining_tokens: budget.remaining_tokens,
+        }
     }
 
     /// Ensure the BM25 index is built from the current context.

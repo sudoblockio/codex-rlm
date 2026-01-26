@@ -846,6 +846,8 @@ async fn make_chatwidget_manual(
         feedback: codex_feedback::CodexFeedback::new(),
         current_rollout_path: None,
         external_editor_state: ExternalEditorState::Closed,
+        #[cfg(feature = "rlm")]
+        rlm_status: None,
     };
     (widget, rx, op_rx)
 }

@@ -511,6 +511,9 @@ pub(crate) struct ChatWidget {
     // Current session rollout path (if known)
     current_rollout_path: Option<PathBuf>,
     external_editor_state: ExternalEditorState,
+    // RLM session status (feature-gated)
+    #[cfg(feature = "rlm")]
+    rlm_status: Option<codex_protocol::protocol::RlmStatusSnapshot>,
 }
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
@@ -2016,6 +2019,8 @@ impl ChatWidget {
             feedback,
             current_rollout_path: None,
             external_editor_state: ExternalEditorState::Closed,
+            #[cfg(feature = "rlm")]
+            rlm_status: None,
         };
 
         widget.prefetch_rate_limits();
@@ -2136,6 +2141,8 @@ impl ChatWidget {
             feedback,
             current_rollout_path: None,
             external_editor_state: ExternalEditorState::Closed,
+            #[cfg(feature = "rlm")]
+            rlm_status: None,
         };
 
         widget.prefetch_rate_limits();
@@ -2474,6 +2481,10 @@ impl ChatWidget {
             }
             SlashCommand::Status => {
                 self.add_status_output();
+            }
+            #[cfg(feature = "rlm")]
+            SlashCommand::Rlm => {
+                self.add_rlm_status_output();
             }
             SlashCommand::Ps => {
                 self.add_ps_output();
@@ -2883,6 +2894,19 @@ impl ChatWidget {
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_) => {}
+
+            #[cfg(feature = "rlm")]
+            EventMsg::RlmStatus(snapshot) => {
+                self.rlm_status = Some(snapshot);
+            }
+            #[cfg(feature = "rlm")]
+            EventMsg::RlmToolActivity(ev) => {
+                if !ev.is_complete {
+                    self.bottom_pane.update_status("Working".to_string(), Some(ev.description));
+                }
+            }
+            #[cfg(not(feature = "rlm"))]
+            EventMsg::RlmStatus(_) | EventMsg::RlmToolActivity(_) => {}
         }
     }
 
@@ -3057,6 +3081,15 @@ impl ChatWidget {
             self.model_display_name(),
             collaboration_mode,
             reasoning_effort_override,
+            #[cfg(feature = "rlm")]
+            self.rlm_status.as_ref(),
+        ));
+    }
+
+    #[cfg(feature = "rlm")]
+    pub(crate) fn add_rlm_status_output(&mut self) {
+        self.add_to_history(crate::status::new_rlm_status_output(
+            self.rlm_status.as_ref(),
         ));
     }
 

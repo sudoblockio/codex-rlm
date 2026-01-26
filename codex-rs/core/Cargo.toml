@@ -102,7 +102,7 @@ wildmatch = { workspace = true }
 default = ["rlm"]
 deterministic_process_ids = []
 test-support = []
-rlm = ["codex-rlm"]
+rlm = ["codex-rlm", "codex-protocol/rlm"]
 
 
 [target.'cfg(target_os = "linux")'.dependencies]

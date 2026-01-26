@@ -30,6 +30,8 @@ pub enum SlashCommand {
     Diff,
     Mention,
     Status,
+    #[cfg(feature = "rlm")]
+    Rlm,
     Mcp,
     Logout,
     Quit,
@@ -58,6 +60,8 @@ impl SlashCommand {
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::Ps => "list background terminals",
+            #[cfg(feature = "rlm")]
+            SlashCommand::Rlm => "show RLM (Recursive Language Model) context status",
             SlashCommand::Model => "choose what model and reasoning effort to use",
             SlashCommand::Collab => "change collaboration mode (experimental)",
             SlashCommand::Approvals => "choose what Codex can do without approval",
@@ -102,6 +106,8 @@ impl SlashCommand {
             | SlashCommand::Feedback
             | SlashCommand::Quit
             | SlashCommand::Exit => true,
+            #[cfg(feature = "rlm")]
+            SlashCommand::Rlm => true,
             SlashCommand::Rollout => true,
             SlashCommand::TestApproval => true,
             SlashCommand::Collab => true,
