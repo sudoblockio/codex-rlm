@@ -279,47 +279,73 @@ impl HierarchicalRoutingGraph {
     }
 
     /// Build a hierarchical routing graph from AGENTS.md files in a DocTreeStore.
+    ///
+    /// Uses absolute paths for all nodes so that ancestor AGENTS.md files
+    /// (discovered above the loaded root) are properly linked as parents
+    /// of in-tree AGENTS.md files.
     pub fn from_doc_tree(store: &crate::context::DocTreeStore) -> Self {
         let mut graph = Self::new();
-        let agents_files = store.list_agents_files();
+        let root = store
+            .root()
+            .canonicalize()
+            .unwrap_or_else(|_| store.root().to_path_buf());
 
-        // First pass: create nodes for each AGENTS.md
-        for path in agents_files {
-            if let Some(content) = store.document_content(path) {
-                let entries = parse_manifest(content);
-                graph.total_entries += entries.len();
-                let node = RoutingNode {
-                    path: path.clone(),
+        // First pass: add ancestor AGENTS.md files (above the loaded root).
+        for ancestor in store.ancestor_agents() {
+            let key = ancestor.abs_path.to_string_lossy().to_string();
+            let entries = parse_manifest(&ancestor.content);
+            graph.total_entries += entries.len();
+            graph.nodes.insert(
+                key.clone(),
+                RoutingNode {
+                    path: key,
                     entries,
                     parent: None,
                     children: Vec::new(),
                     depth: 0,
-                };
-                graph.nodes.insert(path.clone(), node);
+                },
+            );
+        }
+
+        // Second pass: add in-tree AGENTS.md files, converting relative
+        // paths to absolute so parent-child walking works across the
+        // ancestor/in-tree boundary.
+        for rel_path in store.list_agents_files() {
+            if let Some(content) = store.document_content(rel_path) {
+                let abs = root.join(rel_path);
+                let key = abs.to_string_lossy().to_string();
+                let entries = parse_manifest(content);
+                graph.total_entries += entries.len();
+                graph.nodes.insert(
+                    key.clone(),
+                    RoutingNode {
+                        path: key,
+                        entries,
+                        parent: None,
+                        children: Vec::new(),
+                        depth: 0,
+                    },
+                );
             }
         }
 
-        // Second pass: establish parent-child relationships
+        // Third pass: establish parent-child relationships
         let paths: Vec<String> = graph.nodes.keys().cloned().collect();
         for path in &paths {
-            // Find parent by looking for AGENTS.md in parent directories
             let parent_path = find_parent_agents_path(path, &paths);
             if let Some(ref parent) = parent_path {
-                // Update this node's parent
                 if let Some(node) = graph.nodes.get_mut(path) {
                     node.parent = Some(parent.clone());
                 }
-                // Update parent's children
                 if let Some(parent_node) = graph.nodes.get_mut(parent) {
                     parent_node.children.push(path.clone());
                 }
             } else {
-                // This is a root node
                 graph.roots.push(path.clone());
             }
         }
 
-        // Third pass: calculate depths
+        // Fourth pass: calculate depths
         for root in &graph.roots.clone() {
             graph.set_depths(root, 0);
         }
@@ -604,7 +630,7 @@ mod tests {
 
     #[test]
     fn hierarchical_graph_parent_child() {
-        // Manually test the parent finding logic
+        // Manually test the parent finding logic with relative paths
         let paths = vec![
             "AGENTS.md".to_string(),
             "docs/AGENTS.md".to_string(),
@@ -622,6 +648,114 @@ mod tests {
         // Root AGENTS.md has no parent
         let parent3 = find_parent_agents_path("AGENTS.md", &paths);
         assert_eq!(parent3, None);
+    }
+
+    #[test]
+    fn hierarchical_graph_parent_child_absolute_paths() {
+        // Test parent finding with absolute paths (as used when ancestors are present)
+        let paths = vec![
+            "/Users/project/AGENTS.md".to_string(),
+            "/Users/project/src/AGENTS.md".to_string(),
+            "/Users/project/src/docs/AGENTS.md".to_string(),
+        ];
+
+        // src/docs/AGENTS.md should have src/AGENTS.md as parent
+        let parent =
+            find_parent_agents_path("/Users/project/src/docs/AGENTS.md", &paths);
+        assert_eq!(parent, Some("/Users/project/src/AGENTS.md".to_string()));
+
+        // src/AGENTS.md should have project root AGENTS.md as parent
+        let parent2 =
+            find_parent_agents_path("/Users/project/src/AGENTS.md", &paths);
+        assert_eq!(parent2, Some("/Users/project/AGENTS.md".to_string()));
+
+        // Root AGENTS.md has no parent
+        let parent3 =
+            find_parent_agents_path("/Users/project/AGENTS.md", &paths);
+        assert_eq!(parent3, None);
+    }
+
+    #[tokio::test]
+    async fn from_doc_tree_includes_ancestor_agents() {
+        use crate::context::{ContextSource, ContextStore, DocTreeStore};
+
+        // Create a directory structure:
+        //   /tmp_dir/AGENTS.md          (ancestor - above root)
+        //   /tmp_dir/project/           (this is the "root" we load)
+        //   /tmp_dir/project/AGENTS.md  (in-tree root)
+        //   /tmp_dir/project/src/AGENTS.md (in-tree child)
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // Ancestor AGENTS.md (above the loaded root)
+        fs::write(
+            base.join("AGENTS.md"),
+            "- [Project](project/AGENTS.md) - Project root docs\n",
+        )
+        .unwrap();
+
+        // Project root (this is what we'll load)
+        let project = base.join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+
+        fs::write(
+            project.join("AGENTS.md"),
+            "- [Source](src/AGENTS.md) - Source code docs\n",
+        )
+        .unwrap();
+
+        fs::write(
+            project.join("src/AGENTS.md"),
+            "- [Main](main.rs) - Entry point\n",
+        )
+        .unwrap();
+
+        fs::write(project.join("src/main.rs"), "fn main() {}").unwrap();
+
+        // Load from project/ (not the base)
+        let mut store = DocTreeStore::new();
+        store
+            .load(ContextSource::DocTree(project.clone()))
+            .await
+            .unwrap();
+
+        // Should have discovered the ancestor
+        assert_eq!(
+            store.ancestor_agents().len(),
+            1,
+            "should find one ancestor AGENTS.md above the loaded root"
+        );
+
+        // Build routing graph
+        let graph = HierarchicalRoutingGraph::from_doc_tree(&store);
+
+        // Should have 3 nodes: ancestor + 2 in-tree
+        assert_eq!(graph.node_count(), 3);
+
+        // Should have exactly 1 root (the ancestor)
+        assert_eq!(graph.roots().len(), 1);
+
+        // The in-tree root AGENTS.md should have the ancestor as parent
+        let canon_project = project.canonicalize().unwrap();
+        let in_tree_root_key = canon_project.join("AGENTS.md");
+        let in_tree_root_node = graph
+            .get_node(&in_tree_root_key.to_string_lossy())
+            .expect("in-tree root should be in graph");
+        assert!(
+            in_tree_root_node.parent.is_some(),
+            "in-tree root should have ancestor as parent"
+        );
+
+        // The src/AGENTS.md should have the in-tree root as parent
+        let src_key = canon_project.join("src/AGENTS.md");
+        let src_node = graph
+            .get_node(&src_key.to_string_lossy())
+            .expect("src AGENTS.md should be in graph");
+        assert_eq!(
+            src_node.parent.as_deref(),
+            Some(in_tree_root_key.to_string_lossy().as_ref()),
+            "src/AGENTS.md should have project/AGENTS.md as parent"
+        );
     }
 
     #[test]

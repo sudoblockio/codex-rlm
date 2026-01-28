@@ -421,6 +421,15 @@ pub struct Document {
     pub is_agents_md: bool,
 }
 
+/// An AGENTS.md file discovered above the loaded root directory.
+#[derive(Debug, Clone)]
+pub struct AncestorAgent {
+    /// Absolute path to the AGENTS.md file.
+    pub abs_path: PathBuf,
+    /// Content of the AGENTS.md file.
+    pub content: String,
+}
+
 /// Store for a tree of documents.
 #[derive(Debug, Default)]
 pub struct DocTreeStore {
@@ -432,8 +441,10 @@ pub struct DocTreeStore {
     combined_content: String,
     /// Metadata about the context.
     metadata: ContextMetadata,
-    /// List of AGENTS.md files for routing.
+    /// List of AGENTS.md files for routing (relative paths within the tree).
     agents_files: Vec<String>,
+    /// AGENTS.md files found in ancestor directories above root.
+    ancestor_agents: Vec<AncestorAgent>,
 }
 
 impl DocTreeStore {
@@ -469,9 +480,14 @@ impl DocTreeStore {
             .collect()
     }
 
-    /// List all AGENTS.md files.
+    /// List all AGENTS.md files (relative paths within the tree).
     pub fn list_agents_files(&self) -> &[String] {
         &self.agents_files
+    }
+
+    /// List ancestor AGENTS.md files found above the root.
+    pub fn ancestor_agents(&self) -> &[AncestorAgent] {
+        &self.ancestor_agents
     }
 
     /// List documents under a path prefix.
@@ -666,7 +682,39 @@ impl DocTreeStore {
             exclusions,
         };
 
+        // Discover AGENTS.md files in ancestor directories above root.
+        self.discover_ancestor_agents();
+
         Ok(())
+    }
+
+    /// Walk up from root to find AGENTS.md files in parent directories.
+    ///
+    /// These are stored separately from the main document tree so the routing
+    /// graph can include them for proper hierarchy without loading the full
+    /// parent directory trees.
+    fn discover_ancestor_agents(&mut self) {
+        self.ancestor_agents.clear();
+
+        // Canonicalize root to resolve symlinks (e.g., /var -> /private/var on macOS)
+        let canonical_root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        let mut current = canonical_root.parent();
+
+        while let Some(dir) = current {
+            let agents_path = dir.join("AGENTS.md");
+            if agents_path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&agents_path) {
+                    self.ancestor_agents.push(AncestorAgent {
+                        abs_path: agents_path,
+                        content,
+                    });
+                }
+            }
+            current = dir.parent();
+        }
+
+        // Reverse so the highest ancestor is first (root of hierarchy)
+        self.ancestor_agents.reverse();
     }
 }
 
