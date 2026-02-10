@@ -4,6 +4,7 @@ use crate::config::types::Notice;
 use crate::path_utils::resolve_symlink_write_paths;
 use crate::path_utils::write_atomically;
 use anyhow::Context;
+use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::openai_models::ReasoningEffort;
 use std::collections::BTreeMap;
@@ -24,6 +25,8 @@ pub enum ConfigEdit {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     },
+    /// Update the active (or default) model personality.
+    SetModelPersonality { personality: Option<Personality> },
     /// Toggle the acknowledgement flag under `[notice]`.
     SetNoticeHideFullAccessWarning(bool),
     /// Toggle the Windows world-writable directories warning acknowledgement flag.
@@ -50,6 +53,24 @@ pub enum ConfigEdit {
     },
     /// Remove the value stored at the exact dotted path.
     ClearPath { segments: Vec<String> },
+}
+
+pub fn status_line_items_edit(items: &[String]) -> ConfigEdit {
+    if items.is_empty() {
+        return ConfigEdit::ClearPath {
+            segments: vec!["tui".to_string(), "status_line".to_string()],
+        };
+    }
+
+    let mut array = toml_edit::Array::new();
+    for item in items {
+        array.push(item.clone());
+    }
+
+    ConfigEdit::SetPath {
+        segments: vec!["tui".to_string(), "status_line".to_string()],
+        value: TomlItem::Value(array.into()),
+    }
 }
 
 // TODO(jif) move to a dedicated file
@@ -148,6 +169,9 @@ mod document_helpers {
         if !config.enabled {
             entry["enabled"] = value(false);
         }
+        if config.required {
+            entry["required"] = value(true);
+        }
         if let Some(timeout) = config.startup_timeout_sec {
             entry["startup_timeout_sec"] = value(timeout.as_secs_f64());
         }
@@ -163,6 +187,11 @@ mod document_helpers {
             && !disabled_tools.is_empty()
         {
             entry["disabled_tools"] = array_from_iter(disabled_tools.iter().cloned());
+        }
+        if let Some(scopes) = &config.scopes
+            && !scopes.is_empty()
+        {
+            entry["scopes"] = array_from_iter(scopes.iter().cloned());
         }
 
         entry
@@ -269,6 +298,10 @@ impl ConfigDocument {
                 );
                 mutated
             }),
+            ConfigEdit::SetModelPersonality { personality } => Ok(self.write_profile_value(
+                &["personality"],
+                personality.map(|personality| value(personality.to_string())),
+            )),
             ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged) => Ok(self.write_value(
                 Scope::Global,
                 &[Notice::TABLE_KEY, "hide_full_access_warning"],
@@ -709,6 +742,12 @@ impl ConfigEditsBuilder {
             model: model.map(ToOwned::to_owned),
             effort,
         });
+        self
+    }
+
+    pub fn set_personality(mut self, personality: Option<Personality>) -> Self {
+        self.edits
+            .push(ConfigEdit::SetModelPersonality { personality });
         self
     }
 
@@ -1355,11 +1394,13 @@ gpt-5 = "gpt-5.1"
                     cwd: None,
                 },
                 enabled: true,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: Some(vec!["one".to_string(), "two".to_string()]),
                 disabled_tools: None,
+                scopes: None,
             },
         );
 
@@ -1377,11 +1418,13 @@ gpt-5 = "gpt-5.1"
                     env_http_headers: None,
                 },
                 enabled: false,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: Some(std::time::Duration::from_secs(5)),
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: Some(vec!["forbidden".to_string()]),
+                scopes: None,
             },
         );
 
@@ -1442,11 +1485,13 @@ foo = { command = "cmd" }
                     cwd: None,
                 },
                 enabled: true,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
         );
 
@@ -1486,11 +1531,13 @@ foo = { command = "cmd" } # keep me
                     cwd: None,
                 },
                 enabled: false,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
         );
 
@@ -1529,11 +1576,13 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
                     cwd: None,
                 },
                 enabled: true,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
         );
 
@@ -1573,11 +1622,13 @@ foo = { command = "cmd" }
                     cwd: None,
                 },
                 enabled: false,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
         );
 

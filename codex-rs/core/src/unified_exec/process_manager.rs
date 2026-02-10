@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -11,9 +12,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::exec_env::create_env;
+use crate::exec_policy::ExecApprovalRequest;
 use crate::protocol::ExecCommandSource;
 use crate::sandboxing::ExecEnv;
-use crate::sandboxing::SandboxPermissions;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventStage;
@@ -71,6 +72,8 @@ struct PreparedProcessHandles {
     writer_tx: mpsc::Sender<Vec<u8>>,
     output_buffer: OutputBuffer,
     output_notify: Arc<Notify>,
+    output_closed: Arc<AtomicBool>,
+    output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
     command: Vec<String>,
     process_id: String,
@@ -123,14 +126,7 @@ impl UnifiedExecProcessManager {
             .unwrap_or_else(|| context.turn.cwd.clone());
 
         let process = self
-            .open_session_with_sandbox(
-                &request.command,
-                cwd.clone(),
-                request.sandbox_permissions,
-                request.justification,
-                request.tty,
-                context,
-            )
+            .open_session_with_sandbox(&request, cwd.clone(), context)
             .await;
 
         let process = match process {
@@ -168,12 +164,16 @@ impl UnifiedExecProcessManager {
         let OutputHandles {
             output_buffer,
             output_notify,
+            output_closed,
+            output_closed_notify,
             cancellation_token,
         } = process.output_handles();
         let deadline = start + Duration::from_millis(yield_time_ms);
         let collected = Self::collect_output_until_deadline(
             &output_buffer,
             &output_notify,
+            &output_closed,
+            &output_closed_notify,
             &cancellation_token,
             deadline,
         )
@@ -255,6 +255,8 @@ impl UnifiedExecProcessManager {
             writer_tx,
             output_buffer,
             output_notify,
+            output_closed,
+            output_closed_notify,
             cancellation_token,
             command: session_command,
             process_id,
@@ -286,6 +288,8 @@ impl UnifiedExecProcessManager {
         let collected = Self::collect_output_until_deadline(
             &output_buffer,
             &output_notify,
+            &output_closed,
+            &output_closed_notify,
             &cancellation_token,
             deadline,
         )
@@ -376,6 +380,8 @@ impl UnifiedExecProcessManager {
         let OutputHandles {
             output_buffer,
             output_notify,
+            output_closed,
+            output_closed_notify,
             cancellation_token,
         } = entry.process.output_handles();
 
@@ -383,6 +389,8 @@ impl UnifiedExecProcessManager {
             writer_tx: entry.process.writer_sender(),
             output_buffer,
             output_notify,
+            output_closed,
+            output_closed_notify,
             cancellation_token,
             command: entry.command.clone(),
             process_id: entry.process_id.clone(),
@@ -486,38 +494,38 @@ impl UnifiedExecProcessManager {
 
     pub(super) async fn open_session_with_sandbox(
         &self,
-        command: &[String],
+        request: &ExecCommandRequest,
         cwd: PathBuf,
-        sandbox_permissions: SandboxPermissions,
-        justification: Option<String>,
-        tty: bool,
         context: &UnifiedExecContext,
     ) -> Result<UnifiedExecProcess, UnifiedExecError> {
-        let env = apply_unified_exec_env(create_env(&context.turn.shell_environment_policy));
-        let features = context.session.features();
+        let env = apply_unified_exec_env(create_env(
+            &context.turn.shell_environment_policy,
+            Some(context.session.conversation_id),
+        ));
         let mut orchestrator = ToolOrchestrator::new();
         let mut runtime = UnifiedExecRuntime::new(self);
         let exec_approval_requirement = context
             .session
             .services
             .exec_policy
-            .create_exec_approval_requirement_for_command(
-                &features,
-                command,
-                context.turn.approval_policy,
-                &context.turn.sandbox_policy,
-                sandbox_permissions,
-            )
+            .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+                command: &request.command,
+                approval_policy: context.turn.approval_policy,
+                sandbox_policy: &context.turn.sandbox_policy,
+                sandbox_permissions: request.sandbox_permissions,
+                prefix_rule: request.prefix_rule.clone(),
+            })
             .await;
-        let req = UnifiedExecToolRequest::new(
-            command.to_vec(),
+        let req = UnifiedExecToolRequest {
+            command: request.command.clone(),
             cwd,
             env,
-            tty,
-            sandbox_permissions,
-            justification,
+            network: context.turn.config.network.clone(),
+            tty: request.tty,
+            sandbox_permissions: request.sandbox_permissions,
+            justification: request.justification.clone(),
             exec_approval_requirement,
-        );
+        };
         let tool_ctx = ToolCtx {
             session: context.session.as_ref(),
             turn: context.turn.as_ref(),
@@ -539,13 +547,16 @@ impl UnifiedExecProcessManager {
     pub(super) async fn collect_output_until_deadline(
         output_buffer: &OutputBuffer,
         output_notify: &Arc<Notify>,
+        output_closed: &Arc<AtomicBool>,
+        output_closed_notify: &Arc<Notify>,
         cancellation_token: &CancellationToken,
         deadline: Instant,
     ) -> Vec<u8> {
-        const POST_EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(50);
+        const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
 
         let mut collected: Vec<u8> = Vec::with_capacity(4096);
         let mut exit_signal_received = cancellation_token.is_cancelled();
+        let mut post_exit_deadline: Option<Instant> = None;
         loop {
             let drained_chunks: Vec<Vec<u8>>;
             let mut wait_for_output = None;
@@ -559,20 +570,36 @@ impl UnifiedExecProcessManager {
 
             if drained_chunks.is_empty() {
                 exit_signal_received |= cancellation_token.is_cancelled();
+                if exit_signal_received && output_closed.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    break;
+                }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining == Duration::ZERO {
                     break;
                 }
 
-                let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
                 if exit_signal_received {
-                    let grace = remaining.min(POST_EXIT_OUTPUT_GRACE);
-                    if tokio::time::timeout(grace, notified).await.is_err() {
+                    let now = Instant::now();
+                    let close_wait_deadline = *post_exit_deadline
+                        .get_or_insert_with(|| now + remaining.min(POST_EXIT_CLOSE_WAIT_CAP));
+                    let close_wait_remaining = close_wait_deadline.saturating_duration_since(now);
+                    if close_wait_remaining == Duration::ZERO {
                         break;
+                    }
+                    let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
+                    let closed = output_closed_notify.notified();
+                    tokio::pin!(notified);
+                    tokio::pin!(closed);
+                    tokio::select! {
+                        _ = &mut notified => {}
+                        _ = &mut closed => {}
+                        _ = tokio::time::sleep(close_wait_remaining) => break,
                     }
                     continue;
                 }
 
+                let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
                 tokio::pin!(notified);
                 let exit_notified = cancellation_token.cancelled();
                 tokio::pin!(exit_notified);

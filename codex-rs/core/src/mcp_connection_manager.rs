@@ -12,8 +12,12 @@ use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
+use std::time::Instant;
 
+use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::auth::McpAuthStatusEntry;
 use anyhow::Context;
 use anyhow::Result;
@@ -22,6 +26,8 @@ use async_channel::Sender;
 use codex_async_utils::CancelErr;
 use codex_async_utils::OrCancelExt;
 use codex_protocol::approvals::ElicitationRequestEvent;
+use codex_protocol::mcp::CallToolResult;
+use codex_protocol::mcp::RequestId as ProtocolRequestId;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::McpStartupCompleteEvent;
@@ -36,22 +42,23 @@ use codex_rmcp_client::SendElicitation;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use futures::future::Shared;
-use mcp_types::ClientCapabilities;
-use mcp_types::Implementation;
-use mcp_types::ListResourceTemplatesRequestParams;
-use mcp_types::ListResourceTemplatesResult;
-use mcp_types::ListResourcesRequestParams;
-use mcp_types::ListResourcesResult;
-use mcp_types::ReadResourceRequestParams;
-use mcp_types::ReadResourceResult;
-use mcp_types::RequestId;
-use mcp_types::Resource;
-use mcp_types::ResourceTemplate;
-use mcp_types::Tool;
+use rmcp::model::ClientCapabilities;
+use rmcp::model::ElicitationCapability;
+use rmcp::model::Implementation;
+use rmcp::model::InitializeRequestParams;
+use rmcp::model::ListResourceTemplatesResult;
+use rmcp::model::ListResourcesResult;
+use rmcp::model::PaginatedRequestParams;
+use rmcp::model::ProtocolVersion;
+use rmcp::model::ReadResourceRequestParams;
+use rmcp::model::ReadResourceResult;
+use rmcp::model::RequestId;
+use rmcp::model::Resource;
+use rmcp::model::ResourceTemplate;
+use rmcp::model::Tool;
 
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::json;
 use sha1::Digest;
 use sha1::Sha1;
 use tokio::sync::Mutex;
@@ -78,6 +85,8 @@ pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default timeout for individual tool calls.
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+
+const CODEX_APPS_TOOLS_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 /// The Responses API requires tool names to match `^[a-zA-Z0-9_-]+$`.
 /// MCP server/tool names are user-controlled, so sanitize the fully-qualified
@@ -157,6 +166,15 @@ pub(crate) struct ToolInfo {
     pub(crate) connector_name: Option<String>,
 }
 
+#[derive(Clone)]
+struct CachedCodexAppsTools {
+    expires_at: Instant,
+    tools: Vec<ToolInfo>,
+}
+
+static CODEX_APPS_TOOLS_CACHE: LazyLock<StdMutex<Option<CachedCodexAppsTools>>> =
+    LazyLock::new(|| StdMutex::new(None));
+
 type ResponderMap = HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>;
 
 #[derive(Clone, Default)]
@@ -197,7 +215,14 @@ impl ElicitationRequestManager {
                         id: "mcp_elicitation_request".to_string(),
                         msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
                             server_name,
-                            id,
+                            id: match id.clone() {
+                                rmcp::model::NumberOrString::String(value) => {
+                                    ProtocolRequestId::String(value.to_string())
+                                }
+                                rmcp::model::NumberOrString::Number(value) => {
+                                    ProtocolRequestId::Integer(value)
+                                }
+                            },
                             message: elicitation.message,
                         }),
                     })
@@ -302,6 +327,8 @@ pub struct SandboxState {
     pub sandbox_policy: SandboxPolicy,
     pub codex_linux_sandbox_exe: Option<PathBuf>,
     pub sandbox_cwd: PathBuf,
+    #[serde(default)]
+    pub use_linux_sandbox_bwrap: bool,
 }
 
 /// A thin wrapper around a set of running [`RmcpClient`] instances.
@@ -436,17 +463,69 @@ impl McpConnectionManager {
             .await
     }
 
+    pub(crate) async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool {
+        let Some(async_managed_client) = self.clients.get(server_name) else {
+            return false;
+        };
+
+        match tokio::time::timeout(timeout, async_managed_client.client()).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(_)) | Err(_) => false,
+        }
+    }
+
+    pub(crate) async fn required_startup_failures(
+        &self,
+        required_servers: &[String],
+    ) -> Vec<McpStartupFailure> {
+        let mut failures = Vec::new();
+        for server_name in required_servers {
+            let Some(async_managed_client) = self.clients.get(server_name).cloned() else {
+                failures.push(McpStartupFailure {
+                    server: server_name.clone(),
+                    error: format!("required MCP server `{server_name}` was not initialized"),
+                });
+                continue;
+            };
+
+            match async_managed_client.client().await {
+                Ok(_) => {}
+                Err(error) => failures.push(McpStartupFailure {
+                    server: server_name.clone(),
+                    error: startup_outcome_error_message(error),
+                }),
+            }
+        }
+        failures
+    }
+
     /// Returns a single map that contains all tools. Each key is the
     /// fully-qualified name for the tool.
     #[instrument(level = "trace", skip_all)]
     pub async fn list_all_tools(&self) -> HashMap<String, ToolInfo> {
         let mut tools = HashMap::new();
-        for managed_client in self.clients.values() {
-            if let Ok(client) = managed_client.client().await {
-                tools.extend(qualify_tools(filter_tools(
-                    client.tools,
-                    client.tool_filter,
-                )));
+        for (server_name, managed_client) in &self.clients {
+            let client = managed_client.client().await.ok();
+            if let Some(client) = client {
+                let rmcp_client = client.client;
+                let tool_timeout = client.tool_timeout;
+                let tool_filter = client.tool_filter;
+                let mut server_tools = client.tools;
+
+                if server_name == CODEX_APPS_MCP_SERVER_NAME {
+                    match list_tools_for_client(server_name, &rmcp_client, tool_timeout).await {
+                        Ok(fresh_or_cached_tools) => {
+                            server_tools = fresh_or_cached_tools;
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Failed to refresh tools for MCP server '{server_name}', using startup snapshot: {err:#}"
+                            );
+                        }
+                    }
+                }
+
+                tools.extend(qualify_tools(filter_tools(server_tools, tool_filter)));
             }
         }
         tools
@@ -472,7 +551,8 @@ impl McpConnectionManager {
                 let mut cursor: Option<String> = None;
 
                 loop {
-                    let params = cursor.as_ref().map(|next| ListResourcesRequestParams {
+                    let params = cursor.as_ref().map(|next| PaginatedRequestParams {
+                        meta: None,
                         cursor: Some(next.clone()),
                     });
                     let response = match client.list_resources(params, timeout).await {
@@ -537,11 +617,10 @@ impl McpConnectionManager {
                 let mut cursor: Option<String> = None;
 
                 loop {
-                    let params = cursor
-                        .as_ref()
-                        .map(|next| ListResourceTemplatesRequestParams {
-                            cursor: Some(next.clone()),
-                        });
+                    let params = cursor.as_ref().map(|next| PaginatedRequestParams {
+                        meta: None,
+                        cursor: Some(next.clone()),
+                    });
                     let response = match client.list_resource_templates(params, timeout).await {
                         Ok(result) => result,
                         Err(err) => return (server_name_cloned, Err(err)),
@@ -594,7 +673,7 @@ impl McpConnectionManager {
         server: &str,
         tool: &str,
         arguments: Option<serde_json::Value>,
-    ) -> Result<mcp_types::CallToolResult> {
+    ) -> Result<CallToolResult> {
         let client = self.client_by_name(server).await?;
         if !client.tool_filter.allows(tool) {
             return Err(anyhow!(
@@ -602,18 +681,34 @@ impl McpConnectionManager {
             ));
         }
 
-        client
+        let result: rmcp::model::CallToolResult = client
             .client
             .call_tool(tool.to_string(), arguments, client.tool_timeout)
             .await
-            .with_context(|| format!("tool call failed for `{server}/{tool}`"))
+            .with_context(|| format!("tool call failed for `{server}/{tool}`"))?;
+
+        let content = result
+            .content
+            .into_iter()
+            .map(|content| {
+                serde_json::to_value(content)
+                    .unwrap_or_else(|_| serde_json::Value::String("<content>".to_string()))
+            })
+            .collect();
+
+        Ok(CallToolResult {
+            content,
+            structured_content: result.structured_content,
+            is_error: result.is_error,
+            meta: result.meta.and_then(|meta| serde_json::to_value(meta).ok()),
+        })
     }
 
     /// List resources from the specified server.
     pub async fn list_resources(
         &self,
         server: &str,
-        params: Option<ListResourcesRequestParams>,
+        params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourcesResult> {
         let managed = self.client_by_name(server).await?;
         let timeout = managed.tool_timeout;
@@ -629,7 +724,7 @@ impl McpConnectionManager {
     pub async fn list_resource_templates(
         &self,
         server: &str,
-        params: Option<ListResourceTemplatesRequestParams>,
+        params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourceTemplatesResult> {
         let managed = self.client_by_name(server).await?;
         let client = managed.client.clone();
@@ -748,6 +843,63 @@ fn filter_tools(tools: Vec<ToolInfo>, filter: ToolFilter) -> Vec<ToolInfo> {
         .collect()
 }
 
+pub(crate) fn filter_codex_apps_mcp_tools_only(
+    mut mcp_tools: HashMap<String, ToolInfo>,
+    connectors: &[crate::connectors::AppInfo],
+) -> HashMap<String, ToolInfo> {
+    let allowed: HashSet<&str> = connectors
+        .iter()
+        .map(|connector| connector.id.as_str())
+        .collect();
+
+    mcp_tools.retain(|_, tool| {
+        if tool.server_name != CODEX_APPS_MCP_SERVER_NAME {
+            return false;
+        }
+        let Some(connector_id) = tool.connector_id.as_deref() else {
+            return false;
+        };
+        allowed.contains(connector_id)
+    });
+
+    mcp_tools
+}
+
+pub(crate) fn filter_mcp_tools_by_name(
+    mut mcp_tools: HashMap<String, ToolInfo>,
+    selected_tools: &[String],
+) -> HashMap<String, ToolInfo> {
+    let allowed: HashSet<&str> = selected_tools.iter().map(String::as_str).collect();
+    mcp_tools.retain(|name, _| allowed.contains(name.as_str()));
+    mcp_tools
+}
+
+fn normalize_codex_apps_tool_title(
+    server_name: &str,
+    connector_name: Option<&str>,
+    value: &str,
+) -> String {
+    if server_name != CODEX_APPS_MCP_SERVER_NAME {
+        return value.to_string();
+    }
+
+    let Some(connector_name) = connector_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return value.to_string();
+    };
+
+    let prefix = format!("{connector_name}_");
+    if let Some(stripped) = value.strip_prefix(&prefix)
+        && !stripped.is_empty()
+    {
+        return stripped.to_string();
+    }
+
+    value.to_string()
+}
+
 fn resolve_bearer_token(
     server_name: &str,
     bearer_token_env_var: Option<&str>,
@@ -802,25 +954,27 @@ async fn start_server_task(
     tx_event: Sender<Event>,
     elicitation_requests: ElicitationRequestManager,
 ) -> Result<ManagedClient, StartupOutcomeError> {
-    let params = mcp_types::InitializeRequestParams {
+    let params = InitializeRequestParams {
+        meta: None,
         capabilities: ClientCapabilities {
             experimental: None,
             roots: None,
             sampling: None,
             // https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation#capabilities
             // indicates this should be an empty object.
-            elicitation: Some(json!({})),
+            elicitation: Some(ElicitationCapability {
+                schema_validation: None,
+            }),
+            tasks: None,
         },
         client_info: Implementation {
             name: "codex-mcp-client".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             title: Some("Codex".into()),
-            // This field is used by Codex when it is an MCP
-            // server: it should not be used when Codex is
-            // an MCP client.
-            user_agent: None,
+            icons: None,
+            website_url: None,
         },
-        protocol_version: mcp_types::MCP_SCHEMA_VERSION.to_owned(),
+        protocol_version: ProtocolVersion::V_2025_06_18,
     };
 
     let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event);
@@ -901,16 +1055,71 @@ async fn list_tools_for_client(
     client: &Arc<RmcpClient>,
     timeout: Option<Duration>,
 ) -> Result<Vec<ToolInfo>> {
+    if server_name == CODEX_APPS_MCP_SERVER_NAME
+        && let Some(cached_tools) = read_cached_codex_apps_tools()
+    {
+        return Ok(cached_tools);
+    }
+
+    let tools = list_tools_for_client_uncached(server_name, client, timeout).await?;
+    if server_name == CODEX_APPS_MCP_SERVER_NAME {
+        write_cached_codex_apps_tools(&tools);
+    }
+    Ok(tools)
+}
+
+fn read_cached_codex_apps_tools() -> Option<Vec<ToolInfo>> {
+    let mut cache_guard = CODEX_APPS_TOOLS_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+
+    if let Some(cached) = cache_guard.as_ref()
+        && now < cached.expires_at
+    {
+        return Some(cached.tools.clone());
+    }
+
+    *cache_guard = None;
+    None
+}
+
+fn write_cached_codex_apps_tools(tools: &[ToolInfo]) {
+    let mut cache_guard = CODEX_APPS_TOOLS_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *cache_guard = Some(CachedCodexAppsTools {
+        expires_at: Instant::now() + CODEX_APPS_TOOLS_CACHE_TTL,
+        tools: tools.to_vec(),
+    });
+}
+
+async fn list_tools_for_client_uncached(
+    server_name: &str,
+    client: &Arc<RmcpClient>,
+    timeout: Option<Duration>,
+) -> Result<Vec<ToolInfo>> {
     let resp = client.list_tools_with_connector_ids(None, timeout).await?;
     Ok(resp
         .tools
         .into_iter()
-        .map(|tool| ToolInfo {
-            server_name: server_name.to_owned(),
-            tool_name: tool.tool.name.clone(),
-            tool: tool.tool,
-            connector_id: tool.connector_id,
-            connector_name: tool.connector_name,
+        .map(|tool| {
+            let connector_name = tool.connector_name;
+            let mut tool_def = tool.tool;
+            if let Some(title) = tool_def.title.as_deref() {
+                let normalized_title =
+                    normalize_codex_apps_tool_title(server_name, connector_name.as_deref(), title);
+                if tool_def.title.as_deref() != Some(normalized_title.as_str()) {
+                    tool_def.title = Some(normalized_title);
+                }
+            }
+            ToolInfo {
+                server_name: server_name.to_owned(),
+                tool_name: tool_def.name.to_string(),
+                tool: tool_def,
+                connector_id: tool.connector_id,
+                connector_name,
+            }
         })
         .collect())
 }
@@ -982,6 +1191,13 @@ fn is_mcp_client_startup_timeout_error(error: &StartupOutcomeError) -> bool {
     }
 }
 
+fn startup_outcome_error_message(error: StartupOutcomeError) -> String {
+    match error {
+        StartupOutcomeError::Cancelled => "MCP startup cancelled".to_string(),
+        StartupOutcomeError::Failed { error } => error,
+    }
+}
+
 #[cfg(test)]
 mod mcp_init_error_display_tests {}
 
@@ -989,24 +1205,23 @@ mod mcp_init_error_display_tests {}
 mod tests {
     use super::*;
     use codex_protocol::protocol::McpAuthStatus;
-    use mcp_types::ToolInputSchema;
+    use rmcp::model::JsonObject;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     fn create_test_tool(server_name: &str, tool_name: &str) -> ToolInfo {
         ToolInfo {
             server_name: server_name.to_string(),
             tool_name: tool_name.to_string(),
             tool: Tool {
-                annotations: None,
-                description: Some(format!("Test tool: {tool_name}")),
-                input_schema: ToolInputSchema {
-                    properties: None,
-                    required: None,
-                    r#type: "object".to_string(),
-                },
-                name: tool_name.to_string(),
-                output_schema: None,
+                name: tool_name.to_string().into(),
                 title: None,
+                description: Some(format!("Test tool: {tool_name}").into()),
+                input_schema: Arc::new(JsonObject::default()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
             },
             connector_id: None,
             connector_name: None,
@@ -1177,11 +1392,13 @@ mod tests {
                     env_http_headers: None,
                 },
                 enabled: true,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
             auth_status: McpAuthStatus::Unsupported,
         };
@@ -1222,11 +1439,13 @@ mod tests {
                     env_http_headers: None,
                 },
                 enabled: true,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
             auth_status: McpAuthStatus::Unsupported,
         };

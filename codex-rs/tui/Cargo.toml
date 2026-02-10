@@ -33,6 +33,8 @@ codex-ansi-escape = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-backend-client = { workspace = true }
+codex-chatgpt = { workspace = true }
+codex-cloud-requirements = { workspace = true }
 codex-common = { workspace = true, features = [
     "cli",
     "elapsed",
@@ -45,6 +47,7 @@ codex-login = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-rlm = { workspace = true }
+codex-state = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 color-eyre = { workspace = true }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
@@ -52,10 +55,9 @@ derive_more = { workspace = true, features = ["is_variant"] }
 diffy = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
-image = { workspace = true, features = ["jpeg", "png"] }
+image = { workspace = true, features = ["jpeg", "png", "gif", "webp"] }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
-mcp-types = { workspace = true }
 pathdiff = { workspace = true }
 pulldown-cmark = { workspace = true }
 rand = { workspace = true }
@@ -68,6 +70,7 @@ ratatui = { workspace = true, features = [
 ratatui-macros = { workspace = true }
 regex-lite = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
+rmcp = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 shlex = { workspace = true }
@@ -96,6 +99,7 @@ tree-sitter-highlight = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 
 codex-windows-sandbox = { workspace = true }
 tokio-util = { workspace = true, features = ["time"] }

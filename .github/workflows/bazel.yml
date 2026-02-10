@@ -81,7 +81,7 @@ jobs:
       # previously built artifacts to minimize build time. The more precise you are with
       # hashFiles sources the less work bazel will have to do.
       # - name: Mount bazel caches
-      #   uses: actions/cache@v4
+      #   uses: actions/cache@v5
       #   with:
       #     path: |
       #       ~/.cache/bazel-repo-cache
@@ -100,6 +100,7 @@ jobs:
       - name: bazel test //...
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+          CODEX_BWRAP_ENABLE_FFI: ${{ contains(matrix.target, 'unknown-linux') && '1' || '0' }}
         shell: bash
         run: |
           bazel $BAZEL_STARTUP_ARGS --bazelrc=.github/workflows/ci.bazelrc test //... \

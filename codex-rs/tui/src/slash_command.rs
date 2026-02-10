@@ -20,25 +20,33 @@ pub enum SlashCommand {
     Experimental,
     Skills,
     Review,
+    Rename,
     New,
     Resume,
     Fork,
     Init,
     Compact,
+    Plan,
     Collab,
+    Agent,
     // Undo,
     Diff,
     Mention,
     Status,
     #[cfg(feature = "rlm")]
     Rlm,
+    DebugConfig,
+    Statusline,
     Mcp,
+    Apps,
     Logout,
     Quit,
     Exit,
     Feedback,
     Rollout,
     Ps,
+    Clean,
+    Personality,
     TestApproval,
 }
 
@@ -51,6 +59,7 @@ impl SlashCommand {
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my current changes and find issues",
+            SlashCommand::Rename => "rename the current thread",
             SlashCommand::Resume => "resume a saved chat",
             SlashCommand::Fork => "fork the current chat",
             // SlashCommand::Undo => "ask Codex to undo a turn",
@@ -59,16 +68,23 @@ impl SlashCommand {
             SlashCommand::Mention => "mention a file",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
+            SlashCommand::Statusline => "configure which items appear in the status line",
             SlashCommand::Ps => "list background terminals",
             #[cfg(feature = "rlm")]
             SlashCommand::Rlm => "show RLM (Recursive Language Model) context status",
+            SlashCommand::Clean => "stop all background terminals",
             SlashCommand::Model => "choose what model and reasoning effort to use",
+            SlashCommand::Personality => "choose a communication style for Codex",
+            SlashCommand::Plan => "switch to Plan mode",
             SlashCommand::Collab => "change collaboration mode (experimental)",
+            SlashCommand::Agent => "switch the active agent thread",
             SlashCommand::Approvals => "choose what Codex can do without approval",
             SlashCommand::Permissions => "choose what Codex is allowed to do",
             SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
-            SlashCommand::Experimental => "toggle beta features",
+            SlashCommand::Experimental => "toggle experimental features",
             SlashCommand::Mcp => "list configured MCP tools",
+            SlashCommand::Apps => "manage apps",
             SlashCommand::Logout => "log out of Codex",
             SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
@@ -81,6 +97,14 @@ impl SlashCommand {
         self.into()
     }
 
+    /// Whether this command supports inline args (for example `/review ...`).
+    pub fn supports_inline_args(self) -> bool {
+        matches!(
+            self,
+            SlashCommand::Review | SlashCommand::Rename | SlashCommand::Plan
+        )
+    }
+
     /// Whether this command can be run while a task is in progress.
     pub fn available_during_task(self) -> bool {
         match self {
@@ -91,18 +115,24 @@ impl SlashCommand {
             | SlashCommand::Compact
             // | SlashCommand::Undo
             | SlashCommand::Model
+            | SlashCommand::Personality
             | SlashCommand::Approvals
             | SlashCommand::Permissions
             | SlashCommand::ElevateSandbox
             | SlashCommand::Experimental
             | SlashCommand::Review
+            | SlashCommand::Plan
             | SlashCommand::Logout => false,
             SlashCommand::Diff
+            | SlashCommand::Rename
             | SlashCommand::Mention
             | SlashCommand::Skills
             | SlashCommand::Status
+            | SlashCommand::DebugConfig
             | SlashCommand::Ps
+            | SlashCommand::Clean
             | SlashCommand::Mcp
+            | SlashCommand::Apps
             | SlashCommand::Feedback
             | SlashCommand::Quit
             | SlashCommand::Exit => true,
@@ -111,6 +141,8 @@ impl SlashCommand {
             SlashCommand::Rollout => true,
             SlashCommand::TestApproval => true,
             SlashCommand::Collab => true,
+            SlashCommand::Agent => true,
+            SlashCommand::Statusline => false,
         }
     }
 

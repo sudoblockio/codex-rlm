@@ -12,6 +12,7 @@ use crate::protocol::RlmToolActivityEvent;
 use crate::protocol::SandboxPolicy;
 use crate::rlm_session::RlmSession;
 use crate::tools::context::ToolOutput;
+use codex_protocol::models::FunctionCallOutputBody;
 use tokio::sync::Mutex;
 
 pub(crate) fn json_tool_output(value: Value, success: bool) -> ToolOutput {
@@ -21,8 +22,7 @@ pub(crate) fn json_tool_output(value: Value, success: bool) -> ToolOutput {
         )
     });
     ToolOutput::Function {
-        content,
-        content_items: None,
+        body: FunctionCallOutputBody::Text(content),
         success: Some(success),
     }
 }

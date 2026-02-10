@@ -3,6 +3,7 @@ edition.workspace = true
 license.workspace = true
 name = "codex-core"
 version.workspace = true
+build = "build.rs"
 
 [lib]
 doctest = false
@@ -22,6 +23,7 @@ arc-swap = "1.8.0"
 async-channel = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+bm25 = { workspace = true }
 chardetng = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
@@ -34,11 +36,14 @@ codex-execpolicy = { workspace = true }
 codex-file-search = { workspace = true }
 codex-git = { workspace = true }
 codex-keyring-store = { workspace = true }
+codex-network-proxy = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-rlm = { path = "../rlm", optional = true, default-features = false }
 codex-rmcp-client = { workspace = true }
+codex-state = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-home-dir = { workspace = true }
 codex-utils-pty = { workspace = true }
 codex-utils-readiness = { workspace = true }
 codex-utils-string = { workspace = true }
@@ -55,16 +60,24 @@ indexmap = { workspace = true }
 indoc = { workspace = true }
 keyring = { workspace = true, features = ["crypto-rust"] }
 libc = { workspace = true }
-mcp-types = { workspace = true }
+multimap = { workspace = true }
+notify = { workspace = true }
 once_cell = { workspace = true }
 os_info = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 regex-lite = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
+rmcp = { workspace = true, default-features = false, features = [
+    "base64",
+    "macros",
+    "schemars",
+    "server",
+] }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
 serde_yaml = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
@@ -88,6 +101,7 @@ tokio = { workspace = true, features = [
     "signal",
 ] }
 tokio-util = { workspace = true, features = ["rt"] }
+tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
@@ -97,6 +111,7 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4", "v5"] }
 which = { workspace = true }
 wildmatch = { workspace = true }
+zip = { workspace = true }
 
 [features]
 default = ["rlm"]
@@ -124,6 +139,11 @@ openssl-sys = { workspace = true, features = ["vendored"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
 
 [target.'cfg(any(target_os = "freebsd", target_os = "openbsd"))'.dependencies]
 keyring = { workspace = true, features = ["sync-secret-service"] }
@@ -145,6 +165,10 @@ image = { workspace = true, features = ["jpeg", "png"] }
 maplit = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = [
+    "experimental_metrics_custom_reader",
+    "metrics",
+] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

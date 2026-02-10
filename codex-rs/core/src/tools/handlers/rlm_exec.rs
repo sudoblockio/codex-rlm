@@ -112,7 +112,7 @@ impl ToolHandler for RlmExecHandler {
             budget_state,
             tokio::runtime::Handle::current(),
         ));
-        let policy_json = tool_override_policy_json(turn.client.config().as_ref())
+        let policy_json = tool_override_policy_json(turn.config.as_ref())
             .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
         let start = Instant::now();
         let outcome = tokio::task::spawn_blocking(move || {

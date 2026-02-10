@@ -2,8 +2,10 @@ use super::CONFIG_TOML_FILE;
 use super::ConfigToml;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
+use crate::config_loader::CloudRequirementsLoader;
 use crate::config_loader::ConfigLayerEntry;
 use crate::config_loader::ConfigLayerStack;
+use crate::config_loader::ConfigLayerStackOrdering;
 use crate::config_loader::ConfigRequirementsToml;
 use crate::config_loader::LoaderOverrides;
 use crate::config_loader::load_config_layers_state;
@@ -108,6 +110,7 @@ pub struct ConfigService {
     codex_home: PathBuf,
     cli_overrides: Vec<(String, TomlValue)>,
     loader_overrides: LoaderOverrides,
+    cloud_requirements: CloudRequirementsLoader,
 }
 
 impl ConfigService {
@@ -115,11 +118,13 @@ impl ConfigService {
         codex_home: PathBuf,
         cli_overrides: Vec<(String, TomlValue)>,
         loader_overrides: LoaderOverrides,
+        cloud_requirements: CloudRequirementsLoader,
     ) -> Self {
         Self {
             codex_home,
             cli_overrides,
             loader_overrides,
+            cloud_requirements,
         }
     }
 
@@ -128,6 +133,7 @@ impl ConfigService {
             codex_home,
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
         }
     }
 
@@ -145,6 +151,7 @@ impl ConfigService {
                     .cli_overrides(self.cli_overrides.clone())
                     .loader_overrides(self.loader_overrides.clone())
                     .fallback_cwd(Some(cwd.to_path_buf()))
+                    .cloud_requirements(self.cloud_requirements.clone())
                     .build()
                     .await
                     .map_err(|err| {
@@ -171,7 +178,7 @@ impl ConfigService {
             origins: layers.origins(),
             layers: params.include_layers.then(|| {
                 layers
-                    .layers_high_to_low()
+                    .get_layers(ConfigLayerStackOrdering::HighestPrecedenceFirst, true)
                     .iter()
                     .map(|layer| layer.as_layer())
                     .collect()
@@ -375,6 +382,7 @@ impl ConfigService {
             cwd,
             &self.cli_overrides,
             self.loader_overrides.clone(),
+            self.cloud_requirements.clone(),
         )
         .await
     }
@@ -692,6 +700,9 @@ fn find_effective_layer(
 mod tests {
     use super::*;
     use anyhow::Result;
+    use codex_app_server_protocol::AppConfig;
+    use codex_app_server_protocol::AppDisabledReason;
+    use codex_app_server_protocol::AppsConfig;
     use codex_app_server_protocol::AskForApproval;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
@@ -766,7 +777,7 @@ unified_exec = true
         service
             .write_value(ConfigValueWriteParams {
                 file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
-                key_path: "features.remote_compaction".to_string(),
+                key_path: "features.remote_models".to_string(),
                 value: serde_json::json!(true),
                 merge_strategy: MergeStrategy::Replace,
                 expected_version: None,
@@ -786,9 +797,65 @@ hide_full_access_warning = true
 
 [features]
 unified_exec = true
-remote_compaction = true
+remote_models = true
 "#;
         assert_eq!(updated, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_value_supports_nested_app_paths() -> Result<()> {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;
+
+        let service = ConfigService::new_with_defaults(tmp.path().to_path_buf());
+        service
+            .write_value(ConfigValueWriteParams {
+                file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
+                key_path: "apps".to_string(),
+                value: serde_json::json!({
+                    "app1": {
+                        "enabled": false,
+                    },
+                }),
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await
+            .expect("write apps succeeds");
+
+        service
+            .write_value(ConfigValueWriteParams {
+                file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
+                key_path: "apps.app1.disabled_reason".to_string(),
+                value: serde_json::json!("user"),
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await
+            .expect("write apps.app1.disabled_reason succeeds");
+
+        let read = service
+            .read(ConfigReadParams {
+                include_layers: false,
+                cwd: None,
+            })
+            .await
+            .expect("config read succeeds");
+
+        assert_eq!(
+            read.config.apps,
+            Some(AppsConfig {
+                apps: std::collections::HashMap::from([(
+                    "app1".to_string(),
+                    AppConfig {
+                        enabled: false,
+                        disabled_reason: Some(AppDisabledReason::User),
+                    },
+                )]),
+            })
+        );
+
         Ok(())
     }
 
@@ -812,6 +879,7 @@ remote_compaction = true
                 managed_preferences_base64: None,
                 macos_managed_config_requirements_base64: None,
             },
+            CloudRequirementsLoader::default(),
         );
 
         let response = service
@@ -835,41 +903,23 @@ remote_compaction = true
             },
         );
         let layers = response.layers.expect("layers present");
-        if cfg!(unix) {
-            let system_file = AbsolutePathBuf::from_absolute_path(
-                crate::config_loader::SYSTEM_CONFIG_TOML_FILE_UNIX,
-            )
-            .expect("system file");
-            assert_eq!(layers.len(), 3, "expected three layers on unix");
-            assert_eq!(
-                layers.first().unwrap().name,
-                ConfigLayerSource::LegacyManagedConfigTomlFromFile {
-                    file: managed_file.clone()
-                }
-            );
-            assert_eq!(
-                layers.get(1).unwrap().name,
-                ConfigLayerSource::User {
-                    file: user_file.clone()
-                }
-            );
-            assert_eq!(
-                layers.get(2).unwrap().name,
-                ConfigLayerSource::System { file: system_file }
-            );
-        } else {
-            assert_eq!(layers.len(), 2, "expected two layers");
-            assert_eq!(
-                layers.first().unwrap().name,
-                ConfigLayerSource::LegacyManagedConfigTomlFromFile {
-                    file: managed_file.clone()
-                }
-            );
-            assert_eq!(
-                layers.get(1).unwrap().name,
-                ConfigLayerSource::User { file: user_file }
-            );
-        }
+        assert_eq!(layers.len(), 3, "expected three layers");
+        assert_eq!(
+            layers.first().unwrap().name,
+            ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+                file: managed_file.clone()
+            }
+        );
+        assert_eq!(
+            layers.get(1).unwrap().name,
+            ConfigLayerSource::User {
+                file: user_file.clone()
+            }
+        );
+        assert!(matches!(
+            layers.get(2).unwrap().name,
+            ConfigLayerSource::System { .. }
+        ));
     }
 
     #[tokio::test]
@@ -894,6 +944,7 @@ remote_compaction = true
                 managed_preferences_base64: None,
                 macos_managed_config_requirements_base64: None,
             },
+            CloudRequirementsLoader::default(),
         );
 
         let result = service
@@ -998,6 +1049,7 @@ remote_compaction = true
                 managed_preferences_base64: None,
                 macos_managed_config_requirements_base64: None,
             },
+            CloudRequirementsLoader::default(),
         );
 
         let error = service
@@ -1046,6 +1098,7 @@ remote_compaction = true
                 managed_preferences_base64: None,
                 macos_managed_config_requirements_base64: None,
             },
+            CloudRequirementsLoader::default(),
         );
 
         let response = service
@@ -1093,6 +1146,7 @@ remote_compaction = true
                 managed_preferences_base64: None,
                 macos_managed_config_requirements_base64: None,
             },
+            CloudRequirementsLoader::default(),
         );
 
         let result = service

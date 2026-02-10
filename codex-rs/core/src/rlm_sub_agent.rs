@@ -17,6 +17,7 @@ use crate::agent::AgentStatus;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::config::Config;
+use crate::config::Constrained;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
 use codex_protocol::config_types::WebSearchMode;
@@ -62,14 +63,13 @@ pub(crate) fn build_sub_agent_config(
     turn: &TurnContext,
     tool_allowlist: &[String],
 ) -> Result<Config, FunctionCallError> {
-    let base_config = turn.client.config();
-    let mut config = (*base_config).clone();
+    let mut config = (*turn.config).clone();
     let tool_allowlist = expand_tool_allowlist(turn, tool_allowlist);
 
-    config.model = Some(turn.client.get_model());
-    config.model_provider = turn.client.get_provider();
-    config.model_reasoning_effort = turn.client.get_reasoning_effort();
-    config.model_reasoning_summary = turn.client.get_reasoning_summary();
+    config.model = Some(turn.model_info.slug.clone());
+    config.model_provider = turn.provider.clone();
+    config.model_reasoning_effort = turn.reasoning_effort;
+    config.model_reasoning_summary = turn.reasoning_summary;
     config.developer_instructions = turn.developer_instructions.clone();
     config.compact_prompt = turn.compact_prompt.clone();
     config.user_instructions = turn.user_instructions.clone();
@@ -127,9 +127,9 @@ pub(crate) fn build_sub_agent_config(
         .iter()
         .any(|tool| tool.as_str() == "web_search")
     {
-        config.web_search_mode = base_config.web_search_mode;
+        config.web_search_mode = turn.config.web_search_mode.clone();
     } else {
-        config.web_search_mode = Some(WebSearchMode::Disabled);
+        config.web_search_mode = Constrained::allow_any(WebSearchMode::Disabled);
         config.features.disable(Feature::WebSearchRequest);
         config.features.disable(Feature::WebSearchCached);
     }
@@ -147,7 +147,7 @@ fn expand_tool_allowlist(turn: &TurnContext, tool_allowlist: &[String]) -> Vec<S
     });
 
     if wants_shell {
-        let shell_type = turn.client.get_model_info().shell_type;
+        let shell_type = turn.model_info.shell_type;
         match shell_type {
             ConfigShellToolType::UnifiedExec => {
                 if !expanded.iter().any(|tool| tool == "exec_command") {
@@ -189,7 +189,7 @@ pub(crate) async fn run_sub_agent(
     let agent_id = session
         .services
         .agent_control
-        .spawn_agent(config, prompt)
+        .spawn_agent(config, prompt, None)
         .await
         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
 

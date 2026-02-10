@@ -11,9 +11,13 @@ use futures::StreamExt;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::extensions::ExtensionsConfig;
+use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
 use tokio_tungstenite::tungstenite::handshake::server::Request;
 use tokio_tungstenite::tungstenite::handshake::server::Response;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use wiremock::BodyPrintLimit;
 use wiremock::Match;
 use wiremock::Mock;
@@ -76,9 +80,32 @@ impl ResponseMock {
 #[derive(Debug, Clone)]
 pub struct ResponsesRequest(wiremock::Request);
 
+fn is_zstd_encoding(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|entry| entry.trim().eq_ignore_ascii_case("zstd"))
+}
+
+fn decode_body_bytes(body: &[u8], content_encoding: Option<&str>) -> Vec<u8> {
+    if content_encoding.is_some_and(is_zstd_encoding) {
+        zstd::stream::decode_all(std::io::Cursor::new(body)).unwrap_or_else(|err| {
+            panic!("failed to decode zstd request body: {err}");
+        })
+    } else {
+        body.to_vec()
+    }
+}
+
 impl ResponsesRequest {
     pub fn body_json(&self) -> Value {
-        self.0.body_json().unwrap()
+        let body = decode_body_bytes(
+            &self.0.body,
+            self.0
+                .headers
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok()),
+        );
+        serde_json::from_slice(&body).unwrap()
     }
 
     pub fn body_bytes(&self) -> Vec<u8> {
@@ -105,7 +132,7 @@ impl ResponsesRequest {
     }
 
     pub fn input(&self) -> Vec<Value> {
-        self.0.body_json::<Value>().unwrap()["input"]
+        self.body_json()["input"]
             .as_array()
             .expect("input array not found in request")
             .clone()
@@ -245,6 +272,11 @@ impl WebSocketHandshake {
 pub struct WebSocketConnectionConfig {
     pub requests: Vec<Vec<Value>>,
     pub response_headers: Vec<(String, String)>,
+    /// Optional delay inserted before accepting the websocket handshake.
+    ///
+    /// Tests use this to force startup preconnect into an in-flight state so first-turn adoption
+    /// paths can be exercised deterministically.
+    pub accept_delay: Option<Duration>,
 }
 
 pub struct WebSocketTestServer {
@@ -276,6 +308,29 @@ impl WebSocketTestServer {
         self.handshakes.lock().unwrap().clone()
     }
 
+    /// Waits until at least `expected` websocket handshakes have been observed or timeout elapses.
+    ///
+    /// Uses a short bounded polling interval so tests can deterministically wait for background
+    /// preconnect activity without busy-spinning.
+    pub async fn wait_for_handshakes(&self, expected: usize, timeout: Duration) -> bool {
+        if self.handshakes.lock().unwrap().len() >= expected {
+            return true;
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let poll_interval = Duration::from_millis(10);
+        loop {
+            if self.handshakes.lock().unwrap().len() >= expected {
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let sleep_for = std::cmp::min(poll_interval, deadline.saturating_duration_since(now));
+            tokio::time::sleep(sleep_for).await;
+        }
+    }
     pub fn single_handshake(&self) -> WebSocketHandshake {
         let handshakes = self.handshakes.lock().unwrap();
         if handshakes.len() != 1 {
@@ -350,6 +405,10 @@ pub fn sse(events: Vec<Value>) -> String {
         }
     }
     out
+}
+
+pub fn sse_completed(id: &str) -> String {
+    sse(vec![ev_response_created(id), ev_completed(id)])
 }
 
 /// Convenience: SSE event for a completed response with a specific id.
@@ -494,14 +553,13 @@ pub fn ev_reasoning_text_delta(delta: &str) -> Value {
     })
 }
 
-pub fn ev_web_search_call_added(id: &str, status: &str, query: &str) -> Value {
+pub fn ev_web_search_call_added_partial(id: &str, status: &str) -> Value {
     serde_json::json!({
         "type": "response.output_item.added",
         "item": {
             "type": "web_search_call",
             "id": id,
-            "status": status,
-            "action": {"type": "search", "query": query}
+            "status": status
         }
     })
 }
@@ -835,6 +893,7 @@ pub async fn start_websocket_server(connections: Vec<Vec<Vec<Value>>>) -> WebSoc
         .map(|requests| WebSocketConnectionConfig {
             requests,
             response_headers: Vec::new(),
+            accept_delay: None,
         })
         .collect();
     start_websocket_server_with_headers(connections).await
@@ -874,6 +933,10 @@ pub async fn start_websocket_server_with_headers(
                 continue;
             };
 
+            if let Some(delay) = connection.accept_delay {
+                tokio::time::sleep(delay).await;
+            }
+
             let response_headers = connection.response_headers.clone();
             let handshake_log = Arc::clone(&handshakes);
             let callback = move |req: &Request, mut response: Response| {
@@ -905,7 +968,13 @@ pub async fn start_websocket_server_with_headers(
                 Ok(response)
             };
 
-            let mut ws_stream = match tokio_tungstenite::accept_hdr_async(stream, callback).await {
+            let mut ws_stream = match accept_hdr_async_with_config(
+                stream,
+                callback,
+                Some(websocket_accept_config()),
+            )
+            .await
+            {
                 Ok(ws) => ws,
                 Err(_) => continue,
             };
@@ -959,6 +1028,15 @@ fn parse_ws_request_body(message: Message) -> Option<Value> {
         Message::Binary(bytes) => serde_json::from_slice(&bytes).ok(),
         _ => None,
     }
+}
+
+fn websocket_accept_config() -> WebSocketConfig {
+    let mut extensions = ExtensionsConfig::default();
+    extensions.permessage_deflate = Some(DeflateConfig::default());
+
+    let mut config = WebSocketConfig::default();
+    config.extensions = extensions;
+    config
 }
 
 #[derive(Clone)]
@@ -1084,7 +1162,14 @@ fn validate_request_body_invariants(request: &wiremock::Request) {
     if request.method != "POST" || !request.url.path().ends_with("/responses") {
         return;
     }
-    let Ok(body): Result<Value, _> = request.body_json() else {
+    let body_bytes = decode_body_bytes(
+        &request.body,
+        request
+            .headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+    );
+    let Ok(body): Result<Value, _> = serde_json::from_slice(&body_bytes) else {
         return;
     };
     let Some(items) = body.get("input").and_then(Value::as_array) else {

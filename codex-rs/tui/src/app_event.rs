@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+use codex_chatgpt::connectors::AppInfo;
 use codex_common::approval_presets::ApprovalPreset;
 use codex_core::protocol::Event;
 use codex_core::protocol::RateLimitSnapshot;
@@ -18,12 +19,14 @@ use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 
 use crate::bottom_pane::ApprovalRequest;
+use crate::bottom_pane::StatusLineItem;
 use crate::history_cell::HistoryCell;
 
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
-use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::CollaborationModeMask;
+use codex_protocol::config_types::Personality;
 use codex_protocol::openai_models::ReasoningEffort;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,14 +42,19 @@ pub(crate) enum WindowsSandboxFallbackReason {
     ElevationFailed,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectorsSnapshot {
+    pub(crate) connectors: Vec<AppInfo>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
     CodexEvent(Event),
-    ExternalApprovalRequest {
-        thread_id: ThreadId,
-        event: Event,
-    },
+    /// Open the agent picker for switching active threads.
+    OpenAgentPicker,
+    /// Switch the active thread to the selected agent.
+    SelectAgentThread(ThreadId),
 
     /// Start a new session.
     NewSession,
@@ -88,8 +96,23 @@ pub(crate) enum AppEvent {
     /// Result of refreshing rate limits
     RateLimitSnapshotFetched(RateLimitSnapshot),
 
+    /// Result of prefetching connectors.
+    ConnectorsLoaded {
+        result: Result<ConnectorsSnapshot, String>,
+        is_final: bool,
+    },
+
     /// Result of computing a `/diff` command.
     DiffResult(String),
+
+    /// Open the app link view in the bottom pane.
+    OpenAppLink {
+        title: String,
+        description: Option<String>,
+        instructions: String,
+        url: String,
+        is_installed: bool,
+    },
 
     InsertHistoryCell(Box<dyn HistoryCell>),
 
@@ -103,13 +126,21 @@ pub(crate) enum AppEvent {
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
 
-    /// Update the current collaboration mode in the running app and widget.
-    UpdateCollaborationMode(CollaborationMode),
+    /// Update the active collaboration mask in the running app and widget.
+    UpdateCollaborationMode(CollaborationModeMask),
+
+    /// Update the current personality in the running app and widget.
+    UpdatePersonality(Personality),
 
     /// Persist the selected model and reasoning effort to the appropriate config.
     PersistModelSelection {
         model: String,
         effort: Option<ReasoningEffort>,
+    },
+
+    /// Persist the selected personality to the appropriate config.
+    PersistPersonalitySelection {
+        personality: Personality,
     },
 
     /// Open the reasoning selection popup after picking a model.
@@ -168,6 +199,9 @@ pub(crate) enum AppEvent {
         preset: ApprovalPreset,
         mode: WindowsSandboxEnableMode,
     },
+
+    /// Update the Windows sandbox feature mode without changing approval presets.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
     /// Update the current approval policy in the running app and widget.
     UpdateAskForApprovalPolicy(AskForApproval),
@@ -240,10 +274,10 @@ pub(crate) enum AppEvent {
     /// Open the custom prompt option from the review popup.
     OpenReviewCustomPrompt,
 
-    /// Submit a user message with an explicit collaboration mode.
+    /// Submit a user message with an explicit collaboration mask.
     SubmitUserMessageWithMode {
         text: String,
-        collaboration_mode: CollaborationMode,
+        collaboration_mode: CollaborationModeMask,
     },
 
     /// Open the approval popup.
@@ -262,6 +296,18 @@ pub(crate) enum AppEvent {
 
     /// Launch the external editor after a normal draw has completed.
     LaunchExternalEditor,
+
+    /// Async update of the current git branch for status line rendering.
+    StatusLineBranchUpdated {
+        cwd: PathBuf,
+        branch: Option<String>,
+    },
+    /// Apply a user-confirmed status-line item ordering/selection.
+    StatusLineSetup {
+        items: Vec<StatusLineItem>,
+    },
+    /// Dismiss the status-line setup UI without changing config.
+    StatusLineSetupCancelled,
 }
 
 /// The exit strategy requested by the UI layer.

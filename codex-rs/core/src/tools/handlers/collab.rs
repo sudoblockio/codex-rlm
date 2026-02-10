@@ -1,8 +1,10 @@
 use crate::agent::AgentStatus;
+use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::config::Config;
 use crate::error::CodexErr;
+use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -13,19 +15,26 @@ use crate::tools::registry::ToolKind;
 use async_trait::async_trait;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
 use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CollabCloseBeginEvent;
 use codex_protocol::protocol::CollabCloseEndEvent;
+use codex_protocol::protocol::CollabResumeBeginEvent;
+use codex_protocol::protocol::CollabResumeEndEvent;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
 use codex_protocol::protocol::CollabWaitingEndEvent;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use serde::Deserialize;
 use serde::Serialize;
 
 pub struct CollabHandler;
 
+/// Minimum wait timeout to prevent tight polling loops from burning CPU.
+pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = 300_000;
 
@@ -66,6 +75,7 @@ impl ToolHandler for CollabHandler {
         match tool_name.as_str() {
             "spawn_agent" => spawn::handle(session, turn, call_id, arguments).await,
             "send_input" => send_input::handle(session, turn, call_id, arguments).await,
+            "resume_agent" => resume_agent::handle(session, turn, call_id, arguments).await,
             "wait" => wait::handle(session, turn, call_id, arguments).await,
             "close_agent" => close_agent::handle(session, turn, call_id, arguments).await,
             other => Err(FunctionCallError::RespondToModel(format!(
@@ -78,6 +88,9 @@ impl ToolHandler for CollabHandler {
 mod spawn {
     use super::*;
     use crate::agent::AgentRole;
+
+    use crate::agent::exceeds_thread_spawn_depth_limit;
+    use crate::agent::next_thread_spawn_depth;
     use std::sync::Arc;
 
     #[derive(Debug, Deserialize)]
@@ -105,6 +118,13 @@ mod spawn {
                 "Empty message can't be sent to an agent".to_string(),
             ));
         }
+        let session_source = turn.session_source.clone();
+        let child_depth = next_thread_spawn_depth(&session_source);
+        if exceeds_thread_spawn_depth_limit(child_depth) {
+            return Err(FunctionCallError::RespondToModel(
+                "Agent depth limit reached. Solve the task yourself.".to_string(),
+            ));
+        }
         session
             .send_event(
                 &turn,
@@ -116,8 +136,11 @@ mod spawn {
                 .into(),
             )
             .await;
-        let mut config =
-            build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+        let mut config = build_agent_spawn_config(
+            &session.get_base_instructions().await,
+            turn.as_ref(),
+            child_depth,
+        )?;
         agent_role
             .apply_to_config(&mut config)
             .map_err(FunctionCallError::RespondToModel)?;
@@ -125,7 +148,11 @@ mod spawn {
         let result = session
             .services
             .agent_control
-            .spawn_agent(config, prompt.clone())
+            .spawn_agent(
+                config,
+                prompt.clone(),
+                Some(thread_spawn_source(session.conversation_id, child_depth)),
+            )
             .await
             .map_err(collab_spawn_error);
         let (new_thread_id, status) = match &result {
@@ -158,9 +185,8 @@ mod spawn {
         })?;
 
         Ok(ToolOutput::Function {
-            content,
+            body: FunctionCallOutputBody::Text(content),
             success: Some(true),
-            content_items: None,
         })
     }
 }
@@ -247,10 +273,155 @@ mod send_input {
         })?;
 
         Ok(ToolOutput::Function {
-            content,
+            body: FunctionCallOutputBody::Text(content),
             success: Some(true),
-            content_items: None,
         })
+    }
+}
+
+mod resume_agent {
+    use super::*;
+    use crate::agent::next_thread_spawn_depth;
+    use crate::rollout::find_thread_path_by_id_str;
+    use std::sync::Arc;
+
+    #[derive(Debug, Deserialize)]
+    struct ResumeAgentArgs {
+        id: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub(super) struct ResumeAgentResult {
+        pub(super) status: AgentStatus,
+    }
+
+    pub async fn handle(
+        session: Arc<Session>,
+        turn: Arc<TurnContext>,
+        call_id: String,
+        arguments: String,
+    ) -> Result<ToolOutput, FunctionCallError> {
+        let args: ResumeAgentArgs = parse_arguments(&arguments)?;
+        let receiver_thread_id = agent_id(&args.id)?;
+        let child_depth = next_thread_spawn_depth(&turn.session_source);
+        if exceeds_thread_spawn_depth_limit(child_depth) {
+            return Err(FunctionCallError::RespondToModel(
+                "Agent depth limit reached. Solve the task yourself.".to_string(),
+            ));
+        }
+
+        session
+            .send_event(
+                &turn,
+                CollabResumeBeginEvent {
+                    call_id: call_id.clone(),
+                    sender_thread_id: session.conversation_id,
+                    receiver_thread_id,
+                }
+                .into(),
+            )
+            .await;
+
+        let mut status = session
+            .services
+            .agent_control
+            .get_status(receiver_thread_id)
+            .await;
+        let error = if matches!(status, AgentStatus::NotFound) {
+            // If the thread is no longer active, attempt to restore it from rollout.
+            match try_resume_closed_agent(
+                &session,
+                &turn,
+                receiver_thread_id,
+                &args.id,
+                child_depth,
+            )
+            .await
+            {
+                Ok(resumed_status) => {
+                    status = resumed_status;
+                    None
+                }
+                Err(err) => {
+                    status = session
+                        .services
+                        .agent_control
+                        .get_status(receiver_thread_id)
+                        .await;
+                    Some(err)
+                }
+            }
+        } else {
+            None
+        };
+
+        session
+            .send_event(
+                &turn,
+                CollabResumeEndEvent {
+                    call_id,
+                    sender_thread_id: session.conversation_id,
+                    receiver_thread_id,
+                    status: status.clone(),
+                }
+                .into(),
+            )
+            .await;
+
+        if let Some(err) = error {
+            return Err(err);
+        }
+
+        let content = serde_json::to_string(&ResumeAgentResult { status }).map_err(|err| {
+            FunctionCallError::Fatal(format!("failed to serialize resume_agent result: {err}"))
+        })?;
+
+        Ok(ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success: Some(true),
+        })
+    }
+
+    async fn try_resume_closed_agent(
+        session: &Arc<Session>,
+        turn: &Arc<TurnContext>,
+        receiver_thread_id: ThreadId,
+        receiver_id: &str,
+        child_depth: i32,
+    ) -> Result<AgentStatus, FunctionCallError> {
+        let rollout_path = find_thread_path_by_id_str(
+            turn.config.codex_home.as_path(),
+            receiver_id,
+        )
+        .await
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "tool failed: failed to locate rollout for agent {receiver_thread_id}: {err}"
+            ))
+        })?
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "agent with id {receiver_thread_id} not found"
+            ))
+        })?;
+
+        let config = build_agent_resume_config(turn.as_ref(), child_depth)?;
+        let resumed_thread_id = session
+            .services
+            .agent_control
+            .resume_agent_from_rollout(
+                config,
+                rollout_path,
+                thread_spawn_source(session.conversation_id, child_depth),
+            )
+            .await
+            .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+
+        Ok(session
+            .services
+            .agent_control
+            .get_status(resumed_thread_id)
+            .await)
     }
 }
 
@@ -299,6 +470,8 @@ mod wait {
             .collect::<Result<Vec<_>, _>>()?;
 
         // Validate timeout.
+        // Very short timeouts encourage busy-polling loops in the orchestrator prompt and can
+        // cause high CPU usage even with a single active worker, so clamp to a minimum.
         let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
         let timeout_ms = match timeout_ms {
             ms if ms <= 0 => {
@@ -306,7 +479,7 @@ mod wait {
                     "timeout_ms must be greater than zero".to_owned(),
                 ));
             }
-            ms => ms.min(MAX_WAIT_TIMEOUT_MS),
+            ms => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
         };
 
         session
@@ -413,9 +586,8 @@ mod wait {
         })?;
 
         Ok(ToolOutput::Function {
-            content,
+            body: FunctionCallOutputBody::Text(content),
             success: None,
-            content_items: None,
         })
     }
 
@@ -524,9 +696,8 @@ pub mod close_agent {
         })?;
 
         Ok(ToolOutput::Function {
-            content,
+            body: FunctionCallOutputBody::Text(content),
             success: Some(true),
-            content_items: None,
         })
     }
 }
@@ -560,20 +731,45 @@ fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionCallError {
     }
 }
 
+fn thread_spawn_source(parent_thread_id: ThreadId, depth: i32) -> SessionSource {
+    SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth,
+    })
+}
+
 fn build_agent_spawn_config(
     base_instructions: &BaseInstructions,
     turn: &TurnContext,
+    child_depth: i32,
 ) -> Result<Config, FunctionCallError> {
-    let base_config = turn.client.config();
-    let mut config = (*base_config).clone();
+    let mut config = build_agent_shared_config(turn, child_depth)?;
     config.base_instructions = Some(base_instructions.text.clone());
-    config.model = Some(turn.client.get_model());
-    config.model_provider = turn.client.get_provider();
-    config.model_reasoning_effort = turn.client.get_reasoning_effort();
-    config.model_reasoning_summary = turn.client.get_reasoning_summary();
+    Ok(config)
+}
+
+fn build_agent_resume_config(
+    turn: &TurnContext,
+    child_depth: i32,
+) -> Result<Config, FunctionCallError> {
+    let mut config = build_agent_shared_config(turn, child_depth)?;
+    // For resume, keep base instructions sourced from rollout/session metadata.
+    config.base_instructions = None;
+    Ok(config)
+}
+
+fn build_agent_shared_config(
+    turn: &TurnContext,
+    child_depth: i32,
+) -> Result<Config, FunctionCallError> {
+    let base_config = turn.config.clone();
+    let mut config = (*base_config).clone();
+    config.model = Some(turn.model_info.slug.clone());
+    config.model_provider = turn.provider.clone();
+    config.model_reasoning_effort = turn.reasoning_effort;
+    config.model_reasoning_summary = turn.reasoning_summary;
     config.developer_instructions = turn.developer_instructions.clone();
     config.compact_prompt = turn.compact_prompt.clone();
-    config.user_instructions = turn.user_instructions.clone();
     config.shell_environment_policy = turn.shell_environment_policy.clone();
     config.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
     config.cwd = turn.cwd.clone();
@@ -589,14 +785,22 @@ fn build_agent_spawn_config(
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("sandbox_policy is invalid: {err}"))
         })?;
+
+    // If the new agent will be at max depth:
+    if exceeds_thread_spawn_depth_limit(child_depth + 1) {
+        config.features.disable(Feature::Collab);
+    }
+
     Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AuthManager;
     use crate::CodexAuth;
     use crate::ThreadManager;
+    use crate::agent::MAX_THREAD_SPAWN_DEPTH;
     use crate::built_in_model_providers;
     use crate::codex::make_session_and_context;
     use crate::config::types::ShellEnvironmentPolicy;
@@ -604,8 +808,14 @@ mod tests {
     use crate::protocol::AskForApproval;
     use crate::protocol::Op;
     use crate::protocol::SandboxPolicy;
+    use crate::protocol::SessionSource;
+    use crate::protocol::SubAgentSource;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::ThreadId;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
+    use codex_protocol::protocol::InitialHistory;
+    use codex_protocol::protocol::RolloutItem;
     use pretty_assertions::assert_eq;
     use serde::Deserialize;
     use serde_json::json;
@@ -724,6 +934,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_agent_rejects_when_depth_limit_exceeded() {
+        let (mut session, mut turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: session.conversation_id,
+            depth: MAX_THREAD_SPAWN_DEPTH,
+        });
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({"message": "hello"})),
+        );
+        let Err(err) = CollabHandler.handle(invocation).await else {
+            panic!("spawn should fail when depth limit exceeded");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "Agent depth limit reached. Solve the task yourself.".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn send_input_rejects_empty_message() {
         let (session, turn) = make_session_and_context().await;
         let invocation = invocation(
@@ -787,7 +1025,7 @@ mod tests {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
-        let config = turn.client.config().as_ref().clone();
+        let config = turn.config.as_ref().clone();
         let thread = manager.start_thread(config).await.expect("start thread");
         let agent_id = thread.thread_id;
         let invocation = invocation(
@@ -819,6 +1057,208 @@ mod tests {
             .submit(Op::Shutdown {})
             .await
             .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn resume_agent_rejects_invalid_id() {
+        let (session, turn) = make_session_and_context().await;
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "resume_agent",
+            function_payload(json!({"id": "not-a-uuid"})),
+        );
+        let Err(err) = CollabHandler.handle(invocation).await else {
+            panic!("invalid id should be rejected");
+        };
+        let FunctionCallError::RespondToModel(msg) = err else {
+            panic!("expected respond-to-model error");
+        };
+        assert!(msg.starts_with("invalid agent id not-a-uuid:"));
+    }
+
+    #[tokio::test]
+    async fn resume_agent_reports_missing_agent() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let agent_id = ThreadId::new();
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "resume_agent",
+            function_payload(json!({"id": agent_id.to_string()})),
+        );
+        let Err(err) = CollabHandler.handle(invocation).await else {
+            panic!("missing agent should be reported");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(format!("agent with id {agent_id} not found"))
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_agent_noops_for_active_agent() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager.start_thread(config).await.expect("start thread");
+        let agent_id = thread.thread_id;
+        let status_before = manager.agent_control().get_status(agent_id).await;
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "resume_agent",
+            function_payload(json!({"id": agent_id.to_string()})),
+        );
+
+        let output = CollabHandler
+            .handle(invocation)
+            .await
+            .expect("resume_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: resume_agent::ResumeAgentResult =
+            serde_json::from_str(&content).expect("resume_agent result should be json");
+        assert_eq!(result.status, status_before);
+        assert_eq!(success, Some(true));
+
+        let thread_ids = manager.list_thread_ids().await;
+        assert_eq!(thread_ids, vec![agent_id]);
+
+        let _ = thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager
+            .resume_thread_with_history(
+                config,
+                InitialHistory::Forked(vec![RolloutItem::ResponseItem(ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "materialized".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                })]),
+                AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+            )
+            .await
+            .expect("start thread");
+        let agent_id = thread.thread_id;
+        let _ = manager
+            .agent_control()
+            .shutdown_agent(agent_id)
+            .await
+            .expect("shutdown agent");
+        assert_eq!(
+            manager.agent_control().get_status(agent_id).await,
+            AgentStatus::NotFound
+        );
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+
+        let resume_invocation = invocation(
+            session.clone(),
+            turn.clone(),
+            "resume_agent",
+            function_payload(json!({"id": agent_id.to_string()})),
+        );
+        let output = CollabHandler
+            .handle(resume_invocation)
+            .await
+            .expect("resume_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: resume_agent::ResumeAgentResult =
+            serde_json::from_str(&content).expect("resume_agent result should be json");
+        assert_ne!(result.status, AgentStatus::NotFound);
+        assert_eq!(success, Some(true));
+
+        let send_invocation = invocation(
+            session,
+            turn,
+            "send_input",
+            function_payload(json!({"id": agent_id.to_string(), "message": "hello"})),
+        );
+        let output = CollabHandler
+            .handle(send_invocation)
+            .await
+            .expect("send_input should succeed after resume");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: serde_json::Value =
+            serde_json::from_str(&content).expect("send_input result should be json");
+        let submission_id = result
+            .get("submission_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(!submission_id.is_empty());
+        assert_eq!(success, Some(true));
+
+        let _ = manager
+            .agent_control()
+            .shutdown_agent(agent_id)
+            .await
+            .expect("shutdown resumed agent");
+    }
+
+    #[tokio::test]
+    async fn resume_agent_rejects_when_depth_limit_exceeded() {
+        let (mut session, mut turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: session.conversation_id,
+            depth: MAX_THREAD_SPAWN_DEPTH,
+        });
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "resume_agent",
+            function_payload(json!({"id": ThreadId::new().to_string()})),
+        );
+        let Err(err) = CollabHandler.handle(invocation).await else {
+            panic!("resume should fail when depth limit exceeded");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "Agent depth limit reached. Solve the task yourself.".to_string()
+            )
+        );
     }
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -905,7 +1345,9 @@ mod tests {
             .await
             .expect("wait should succeed");
         let ToolOutput::Function {
-            content, success, ..
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
         } = output
         else {
             panic!("expected function output");
@@ -930,7 +1372,7 @@ mod tests {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
-        let config = turn.client.config().as_ref().clone();
+        let config = turn.config.as_ref().clone();
         let thread = manager.start_thread(config).await.expect("start thread");
         let agent_id = thread.thread_id;
         let invocation = invocation(
@@ -939,7 +1381,7 @@ mod tests {
             "wait",
             function_payload(json!({
                 "ids": [agent_id.to_string()],
-                "timeout_ms": 10
+                "timeout_ms": MIN_WAIT_TIMEOUT_MS
             })),
         );
         let output = CollabHandler
@@ -947,7 +1389,9 @@ mod tests {
             .await
             .expect("wait should succeed");
         let ToolOutput::Function {
-            content, success, ..
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
         } = output
         else {
             panic!("expected function output");
@@ -971,11 +1415,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_clamps_short_timeouts_to_minimum() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager.start_thread(config).await.expect("start thread");
+        let agent_id = thread.thread_id;
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait",
+            function_payload(json!({
+                "ids": [agent_id.to_string()],
+                "timeout_ms": 10
+            })),
+        );
+
+        let early = timeout(Duration::from_millis(50), CollabHandler.handle(invocation)).await;
+        assert!(
+            early.is_err(),
+            "wait should not return before the minimum timeout clamp"
+        );
+
+        let _ = thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
     async fn wait_returns_final_status_without_timeout() {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
-        let config = turn.client.config().as_ref().clone();
+        let config = turn.config.as_ref().clone();
         let thread = manager.start_thread(config).await.expect("start thread");
         let agent_id = thread.thread_id;
         let mut status_rx = manager
@@ -1007,7 +1482,9 @@ mod tests {
             .await
             .expect("wait should succeed");
         let ToolOutput::Function {
-            content, success, ..
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
         } = output
         else {
             panic!("expected function output");
@@ -1029,7 +1506,7 @@ mod tests {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
-        let config = turn.client.config().as_ref().clone();
+        let config = turn.config.as_ref().clone();
         let thread = manager.start_thread(config).await.expect("start thread");
         let agent_id = thread.thread_id;
         let status_before = manager.agent_control().get_status(agent_id).await;
@@ -1045,7 +1522,9 @@ mod tests {
             .await
             .expect("close_agent should succeed");
         let ToolOutput::Function {
-            content, success, ..
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
         } = output
         else {
             panic!("expected function output");
@@ -1067,13 +1546,43 @@ mod tests {
 
     #[tokio::test]
     async fn build_agent_spawn_config_uses_turn_context_values() {
+        fn pick_allowed_approval_policy(
+            constraint: &crate::config::Constrained<AskForApproval>,
+            base: AskForApproval,
+        ) -> AskForApproval {
+            let candidates = [
+                AskForApproval::Never,
+                AskForApproval::UnlessTrusted,
+                AskForApproval::OnRequest,
+                AskForApproval::OnFailure,
+            ];
+            candidates
+                .into_iter()
+                .find(|candidate| *candidate != base && constraint.can_set(candidate).is_ok())
+                .unwrap_or(base)
+        }
+
+        fn pick_allowed_sandbox_policy(
+            constraint: &crate::config::Constrained<SandboxPolicy>,
+            base: SandboxPolicy,
+        ) -> SandboxPolicy {
+            let candidates = [
+                SandboxPolicy::new_read_only_policy(),
+                SandboxPolicy::new_workspace_write_policy(),
+                SandboxPolicy::DangerFullAccess,
+            ];
+            candidates
+                .into_iter()
+                .find(|candidate| *candidate != base && constraint.can_set(candidate).is_ok())
+                .unwrap_or(base)
+        }
+
         let (_session, mut turn) = make_session_and_context().await;
         let base_instructions = BaseInstructions {
             text: "base".to_string(),
         };
         turn.developer_instructions = Some("dev".to_string());
         turn.compact_prompt = Some("compact".to_string());
-        turn.user_instructions = Some("user".to_string());
         turn.shell_environment_policy = ShellEnvironmentPolicy {
             use_profile: true,
             ..ShellEnvironmentPolicy::default()
@@ -1081,19 +1590,71 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         turn.cwd = temp_dir.path().to_path_buf();
         turn.codex_linux_sandbox_exe = Some(PathBuf::from("/bin/echo"));
-        turn.approval_policy = AskForApproval::Never;
-        turn.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        turn.approval_policy = pick_allowed_approval_policy(
+            &turn.config.approval_policy,
+            *turn.config.approval_policy.get(),
+        );
+        turn.sandbox_policy = pick_allowed_sandbox_policy(
+            &turn.config.sandbox_policy,
+            turn.config.sandbox_policy.get().clone(),
+        );
 
-        let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
-        let mut expected = (*turn.client.config()).clone();
+        let config = build_agent_spawn_config(&base_instructions, &turn, 0).expect("spawn config");
+        let mut expected = (*turn.config).clone();
         expected.base_instructions = Some(base_instructions.text);
-        expected.model = Some(turn.client.get_model());
-        expected.model_provider = turn.client.get_provider();
-        expected.model_reasoning_effort = turn.client.get_reasoning_effort();
-        expected.model_reasoning_summary = turn.client.get_reasoning_summary();
+        expected.model = Some(turn.model_info.slug.clone());
+        expected.model_provider = turn.provider.clone();
+        expected.model_reasoning_effort = turn.reasoning_effort;
+        expected.model_reasoning_summary = turn.reasoning_summary;
         expected.developer_instructions = turn.developer_instructions.clone();
         expected.compact_prompt = turn.compact_prompt.clone();
-        expected.user_instructions = turn.user_instructions.clone();
+        expected.shell_environment_policy = turn.shell_environment_policy.clone();
+        expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
+        expected.cwd = turn.cwd.clone();
+        expected
+            .approval_policy
+            .set(turn.approval_policy)
+            .expect("approval policy set");
+        expected
+            .sandbox_policy
+            .set(turn.sandbox_policy)
+            .expect("sandbox policy set");
+        assert_eq!(config, expected);
+    }
+
+    #[tokio::test]
+    async fn build_agent_spawn_config_preserves_base_user_instructions() {
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut base_config = (*turn.config).clone();
+        base_config.user_instructions = Some("base-user".to_string());
+        turn.user_instructions = Some("resolved-user".to_string());
+        turn.config = Arc::new(base_config.clone());
+        let base_instructions = BaseInstructions {
+            text: "base".to_string(),
+        };
+
+        let config = build_agent_spawn_config(&base_instructions, &turn, 0).expect("spawn config");
+
+        assert_eq!(config.user_instructions, base_config.user_instructions);
+    }
+
+    #[tokio::test]
+    async fn build_agent_resume_config_clears_base_instructions() {
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut base_config = (*turn.config).clone();
+        base_config.base_instructions = Some("caller-base".to_string());
+        turn.config = Arc::new(base_config);
+
+        let config = build_agent_resume_config(&turn, 0).expect("resume config");
+
+        let mut expected = (*turn.config).clone();
+        expected.base_instructions = None;
+        expected.model = Some(turn.model_info.slug.clone());
+        expected.model_provider = turn.provider.clone();
+        expected.model_reasoning_effort = turn.reasoning_effort;
+        expected.model_reasoning_summary = turn.reasoning_summary;
+        expected.developer_instructions = turn.developer_instructions.clone();
+        expected.compact_prompt = turn.compact_prompt.clone();
         expected.shell_environment_policy = turn.shell_environment_policy.clone();
         expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
         expected.cwd = turn.cwd.clone();

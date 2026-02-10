@@ -50,6 +50,10 @@ pub struct McpServerConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
+    /// When `true`, `codex exec` exits with an error if this MCP server fails to initialize.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
+
     /// Reason this server was disabled after applying requirements.
     #[serde(skip)]
     pub disabled_reason: Option<McpServerDisabledReason>,
@@ -73,6 +77,10 @@ pub struct McpServerConfig {
     /// Explicit deny-list of tools. These tools will be removed after applying `enabled_tools`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_tools: Option<Vec<String>>,
+
+    /// Optional OAuth scopes to request during MCP login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
 }
 
 // Raw MCP config shape used for deserialization and JSON Schema generation.
@@ -110,9 +118,13 @@ pub(crate) struct RawMcpServerConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
+    pub required: Option<bool>,
+    #[serde(default)]
     pub enabled_tools: Option<Vec<String>>,
     #[serde(default)]
     pub disabled_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
 }
 
 impl<'de> Deserialize<'de> for McpServerConfig {
@@ -132,8 +144,10 @@ impl<'de> Deserialize<'de> for McpServerConfig {
         };
         let tool_timeout_sec = raw.tool_timeout_sec;
         let enabled = raw.enabled.unwrap_or_else(default_enabled);
+        let required = raw.required.unwrap_or_default();
         let enabled_tools = raw.enabled_tools.clone();
         let disabled_tools = raw.disabled_tools.clone();
+        let scopes = raw.scopes.clone();
 
         fn throw_if_set<E, T>(transport: &str, field: &str, value: Option<&T>) -> Result<(), E>
         where
@@ -185,9 +199,11 @@ impl<'de> Deserialize<'de> for McpServerConfig {
             startup_timeout_sec,
             tool_timeout_sec,
             enabled,
+            required,
             disabled_reason: None,
             enabled_tools,
             disabled_tools,
+            scopes,
         })
     }
 }
@@ -322,6 +338,44 @@ pub struct AnalyticsConfigToml {
 pub struct FeedbackConfigToml {
     /// When `false`, disables the feedback flow across Codex product surfaces.
     pub enabled: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AppDisabledReason {
+    Unknown,
+    User,
+}
+
+impl fmt::Display for AppDisabledReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AppDisabledReason::Unknown => write!(f, "unknown"),
+            AppDisabledReason::User => write!(f, "user"),
+        }
+    }
+}
+
+/// Config values for a single app/connector.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct AppConfig {
+    /// When `false`, Codex does not surface this app.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+
+    /// Reason this app was disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<AppDisabledReason>,
+}
+
+/// App/connector settings loaded from `config.toml`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct AppsConfigToml {
+    /// Per-app settings keyed by app ID (for example `[apps.google_drive]`).
+    #[serde(default, flatten)]
+    pub apps: HashMap<String, AppConfig>,
 }
 
 // ===== OTEL configuration =====
@@ -460,6 +514,25 @@ impl Default for Notifications {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationMethod {
+    #[default]
+    Auto,
+    Osc9,
+    Bel,
+}
+
+impl fmt::Display for NotificationMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NotificationMethod::Auto => write!(f, "auto"),
+            NotificationMethod::Osc9 => write!(f, "osc9"),
+            NotificationMethod::Bel => write!(f, "bel"),
+        }
+    }
+}
+
 /// Collection of settings that are specific to the TUI.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -468,6 +541,11 @@ pub struct Tui {
     /// Defaults to `true`.
     #[serde(default)]
     pub notifications: Notifications,
+
+    /// Notification method to use for unfocused terminal notifications.
+    /// Defaults to `auto`.
+    #[serde(default)]
+    pub notification_method: NotificationMethod,
 
     /// Enable animations (welcome screen, shimmer effects, spinners).
     /// Defaults to `true`.
@@ -479,7 +557,7 @@ pub struct Tui {
     #[serde(default = "default_true")]
     pub show_tooltips: bool,
 
-    /// Start the TUI in the specified collaboration mode (plan/execute/etc.).
+    /// Start the TUI in the specified collaboration mode (plan/default).
     /// Defaults to unset.
     #[serde(default)]
     pub experimental_mode: Option<ModeKind>,
@@ -494,6 +572,12 @@ pub struct Tui {
     /// scrollback in terminal multiplexers like Zellij that follow the xterm spec.
     #[serde(default)]
     pub alternate_screen: AltScreenMode,
+
+    /// Ordered list of status line item identifiers.
+    ///
+    /// When set, the TUI renders the selected items as the status line.
+    #[serde(default)]
+    pub status_line: Option<Vec<String>>,
 }
 
 const fn default_true() -> bool {
@@ -504,7 +588,6 @@ const fn default_true() -> bool {
 /// (primarily the Codex IDE extension). NOTE: these are different from
 /// notifications - notices are warnings, NUX screens, acknowledgements, etc.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
 pub struct Notice {
     /// Tracks whether the user has acknowledged the full access warning prompt.
     pub hide_full_access_warning: Option<bool>,
@@ -700,6 +783,7 @@ mod tests {
             }
         );
         assert!(cfg.enabled);
+        assert!(!cfg.required);
         assert!(cfg.enabled_tools.is_none());
         assert!(cfg.disabled_tools.is_none());
     }
@@ -806,6 +890,20 @@ mod tests {
         .expect("should deserialize disabled server config");
 
         assert!(!cfg.enabled);
+        assert!(!cfg.required);
+    }
+
+    #[test]
+    fn deserialize_required_server_config() {
+        let cfg: McpServerConfig = toml::from_str(
+            r#"
+            command = "echo"
+            required = true
+        "#,
+        )
+        .expect("should deserialize required server config");
+
+        assert!(cfg.required);
     }
 
     #[test]
